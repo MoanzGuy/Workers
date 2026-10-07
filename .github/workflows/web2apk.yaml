@@ -1,0 +1,258 @@
+name: Web to APK Build
+
+# Ditrigger oleh bot Telegram (Tirzz Build Bot) lewat workflow_dispatch.
+# Input dikirim oleh server.js -> triggerWeb2ApkWorkflow().
+"on":
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: "URL website yang mau dibungkus jadi APK (WebView)"
+        required: true
+        type: string
+      app_name:
+        description: "Nama aplikasi (ditampilkan di home screen)"
+        required: true
+        type: string
+      icon_url:
+        description: "URL icon PNG (opsional)"
+        required: false
+        default: ""
+        type: string
+      tag:
+        description: "Tag unik build"
+        required: true
+        type: string
+
+# PENTING: input di atas berasal langsung dari user Telegram, jadi TIDAK BOLEH
+# diinterpolasi pakai ${{ github.event.inputs.x }} di dalam "run:" (celah shell
+# injection). Semua dipindah ke `env:` lebih dulu dan dipakai lewat variabel
+# shell ($WEB_URL, dst), dan untuk isi source Dart dipakai --dart-define
+# (bukan ditulis manual ke file .dart) supaya nilainya tidak pernah jadi kode.
+env:
+  WEB_URL: ${{ github.event.inputs.web_url }}
+  APP_NAME: ${{ github.event.inputs.app_name }}
+  ICON_URL: ${{ github.event.inputs.icon_url }}
+  BUILD_TAG: ${{ github.event.inputs.tag }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web2apk-build-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validasi input
+        run: |
+          set -euo pipefail
+          if [ -z "${WEB_URL:-}" ]; then
+            echo "::error::Input web_url kosong."
+            exit 1
+          fi
+          case "$WEB_URL" in
+            http://*|https://*) ;;
+            *) echo "::error::web_url harus diawali http:// atau https://"; exit 1 ;;
+          esac
+          if [ -z "${APP_NAME:-}" ]; then
+            echo "::error::Input app_name kosong."
+            exit 1
+          fi
+          if [ -z "${BUILD_TAG:-}" ]; then
+            echo "::error::Input tag kosong."
+            exit 1
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          cache: true
+
+      - name: Buat project Flutter WebView
+        run: flutter create --org com.tirzz.web2apk --project-name web2apk_app webapp
+
+      - name: Tambah dependency webview_flutter
+        working-directory: webapp
+        run: flutter pub add webview_flutter
+
+      # File ini STATIS (heredoc pakai 'EOF' berkutip supaya tidak ada variabel
+      # shell yang di-expand ke dalamnya). URL & nama app di-inject aman lewat
+      # --dart-define saat build, bukan ditulis langsung ke source.
+      - name: Tulis lib/main.dart (template statis)
+        working-directory: webapp
+        run: |
+          cat > lib/main.dart << 'EOF'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          const String kWebUrl = String.fromEnvironment('WEB_URL', defaultValue: 'https://example.com');
+          const String kAppName = String.fromEnvironment('APP_NAME', defaultValue: 'WebView App');
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: kAppName,
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
+                home: const WebViewScreen(),
+              );
+            }
+          }
+
+          class WebViewScreen extends StatefulWidget {
+            const WebViewScreen({super.key});
+
+            @override
+            State<WebViewScreen> createState() => _WebViewScreenState();
+          }
+
+          class _WebViewScreenState extends State<WebViewScreen> {
+            late final WebViewController _controller;
+            bool _loading = true;
+
+            @override
+            void initState() {
+              super.initState();
+              _controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onPageStarted: (_) => setState(() => _loading = true),
+                    onPageFinished: (_) => setState(() => _loading = false),
+                  ),
+                )
+                ..loadRequest(Uri.parse(kWebUrl));
+            }
+
+            Future<bool> _onWillPop() async {
+              if (await _controller.canGoBack()) {
+                await _controller.goBack();
+                return false;
+              }
+              return true;
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return PopScope(
+                canPop: false,
+                onPopInvoked: (didPop) async {
+                  if (didPop) return;
+                  if (await _onWillPop()) {
+                    if (context.mounted) Navigator.of(context).maybePop();
+                  }
+                },
+                child: Scaffold(
+                  body: SafeArea(
+                    child: Stack(
+                      children: [
+                        WebViewWidget(controller: _controller),
+                        if (_loading) const Center(child: CircularProgressIndicator()),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Set nama aplikasi di AndroidManifest.xml
+        working-directory: webapp
+        run: |
+          python3 - << 'PYEOF'
+          import os
+          from xml.sax.saxutils import escape
+
+          app_name = escape(os.environ["APP_NAME"])
+          manifest_path = "android/app/src/main/AndroidManifest.xml"
+
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          import re
+          new_content, count = re.subn(
+              r'android:label="[^"]*"',
+              f'android:label="{app_name}"',
+              content,
+              count=1,
+          )
+          if count == 0:
+              raise SystemExit("android:label tidak ditemukan di AndroidManifest.xml")
+
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              f.write(new_content)
+
+          print(f"AndroidManifest.xml label diset ke: {app_name}")
+          PYEOF
+
+      - name: Download & pasang icon (opsional)
+        if: ${{ github.event.inputs.icon_url != '' }}
+        working-directory: webapp
+        run: |
+          set -euo pipefail
+          mkdir -p assets/icon
+          curl -fL --retry 3 --retry-delay 5 -o assets/icon/icon.png "$ICON_URL"
+
+          cat >> pubspec.yaml << 'EOF'
+
+          flutter_icons:
+            android: true
+            ios: false
+            image_path: "assets/icon/icon.png"
+          EOF
+
+          flutter pub add --dev flutter_launcher_icons
+          dart run flutter_launcher_icons
+
+      - name: flutter pub get
+        working-directory: webapp
+        run: flutter pub get
+
+      - name: Build APK (release)
+        working-directory: webapp
+        run: |
+          set -euo pipefail
+          flutter build apk --release \
+            --dart-define=WEB_URL="$WEB_URL" \
+            --dart-define=APP_NAME="$APP_NAME"
+
+      - name: Kumpulkan hasil APK
+        id: apk
+        run: |
+          set -euo pipefail
+          APK_PATH="$(find webapp -type f -name '*.apk' -path '*/outputs/flutter-apk/*' | sort | head -n 1)"
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::Build sukses tapi file .apk tidak ditemukan."
+            exit 1
+          fi
+          mkdir -p apk_output
+          SAFE_TAG="$(echo "$BUILD_TAG" | tr -c 'A-Za-z0-9._-' '_')"
+          DEST="apk_output/web2apk-${SAFE_TAG}.apk"
+          cp "$APK_PATH" "$DEST"
+          echo "path=$DEST" >> "$GITHUB_OUTPUT"
+          echo "name=apk-build-${SAFE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Nama HARUS mengandung kata "apk" atau "build" â€” dibaca oleh bot
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 1
+          if-no-files-found: error
