@@ -1,0 +1,110 @@
+name: Flutter Build APK
+
+# Ditrigger oleh bot Telegram (Tirzz Build Bot) lewat workflow_dispatch.
+# Input dikirim oleh server.js -> triggerWorkflow(). Simpan file ini di repo target
+# (GITHUB_OWNER/GITHUB_REPO di .env bot) pada path: .github/workflows/flutter_build.yml
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL ZIP project Flutter (GitHub Release asset)"
+        required: true
+        type: string
+      tag:
+        description: "Tag unik build (dipakai untuk nama artifact & release cleanup)"
+        required: true
+        type: string
+      build_type:
+        description: "Mode build: debug atau release"
+        required: false
+        default: "release"
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Validasi input wajib
+        run: |
+          if [ -z "${{ inputs.zip_url }}" ]; then
+            echo "::error::Input zip_url kosong."
+            exit 1
+          fi
+          if [ -z "${{ inputs.tag }}" ]; then
+            echo "::error::Input tag kosong."
+            exit 1
+          fi
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      # PENTING — JANGAN naikkan versi ini ke >= 3.44 kecuali font_awesome_flutter
+      # di project kamu sudah di-upgrade ke v11+. Flutter 3.44 menjadikan class
+      # IconData "final" (tidak bisa di-extend), yang membuat font_awesome_flutter
+      # versi lama (mis. 10.12.0) gagal compile dengan error:
+      #   "The class 'IconData' can't be extended outside of its library
+      #    because it's a final class."
+      # 3.41.x adalah rilis stabil terakhir SEBELUM breaking change tersebut.
+      - name: Setup Flutter SDK (pinned 3.41.x, sebelum breaking change IconData final)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: "stable"
+          cache: true
+
+      - name: Download ZIP project
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: curl -L --fail -o project.zip "$ZIP_URL"
+
+      - name: Extract ZIP
+        run: |
+          rm -rf project
+          mkdir -p project
+          unzip -q project.zip -d project
+
+          # Kalau isi ZIP cuma 1 folder pembungkus di root, naikkan isinya
+          shopt -s nullglob dotglob
+          entries=(project/*/)
+          if [ "${#entries[@]}" -eq 1 ] && [ -f "${entries[0]}pubspec.yaml" ]; then
+            tmp=$(mktemp -d)
+            mv "${entries[0]}"* "$tmp"/
+            rm -rf project
+            mv "$tmp" project
+          fi
+
+      - name: Validasi pubspec.yaml
+        run: |
+          if [ ! -f project/pubspec.yaml ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ZIP berisi project Flutter yang valid (pubspec.yaml di root project)."
+            exit 1
+          fi
+
+      - name: Flutter pub get
+        working-directory: project
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: project
+        run: |
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - name: Upload APK sebagai artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: project/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: warn
+          retention-days: 1
