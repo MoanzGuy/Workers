@@ -34,9 +34,9 @@ jobs:
 
     steps:
 
-      # ==========================================================
-      # 01 - START
-      # ==========================================================
+      # =========================================================
+      # 01 START
+      # =========================================================
 
       - name: "01 • Worker start"
         shell: bash
@@ -45,15 +45,15 @@ jobs:
 
           echo "=========================================="
           echo "        WEB TO APK BY ZIPERR"
-          echo "        ADAPTIVE FLUTTER WORKER"
+          echo "        FLUTTER BUILD WORKER"
           echo "=========================================="
           echo "Job ID : ${{ inputs.jobId }}"
           echo "User ID: ${{ inputs.userId }}"
           echo "=========================================="
 
-      # ==========================================================
-      # 02 - PAYLOAD
-      # ==========================================================
+      # =========================================================
+      # 02 PAYLOAD
+      # =========================================================
 
       - name: "02 • Parse payload"
         env:
@@ -80,7 +80,7 @@ jobs:
 
           if not isinstance(data, dict):
               raise SystemExit(
-                  "ERROR: payload harus JSON object"
+                  "ERROR: payload harus berupa JSON object"
               )
 
           source_url = (
@@ -93,20 +93,16 @@ jobs:
 
           if not source_url:
               raise SystemExit(
-                  "ERROR: source ZIP URL tidak ditemukan"
+                  "ERROR: URL source ZIP tidak ditemukan"
               )
 
           build_type = str(
               data.get("buildType")
               or data.get("build_type")
               or "release"
-          ).lower().strip()
+          ).strip().lower()
 
-          if build_type not in (
-              "release",
-              "debug",
-              "profile"
-          ):
+          if build_type not in ("release", "debug", "profile"):
               build_type = "release"
 
           with open(
@@ -114,39 +110,32 @@ jobs:
               "a",
               encoding="utf-8"
           ) as env:
+              env.write(f"SOURCE_URL={source_url}\n")
+              env.write(f"BUILD_TYPE={build_type}\n")
 
-              env.write(
-                  f"SOURCE_URL={source_url}\n"
-              )
-
-              env.write(
-                  f"BUILD_TYPE={build_type}\n"
-              )
-
-          print("Payload          : OK")
-          print("Build type       :", build_type)
-          print("Source URL       : FOUND")
+          print("Payload    : OK")
+          print("Build type :", build_type)
+          print("Source URL : FOUND")
           PY
 
-      # ==========================================================
-      # 03 - PUB CACHE
-      # ==========================================================
+      # =========================================================
+      # 03 CACHE
+      # =========================================================
 
-      - name: "03 • Prepare Pub cache"
+      - name: "03 • Prepare cache"
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p "$HOME/.pub-cache"
 
-          echo "PUB_CACHE=$HOME/.pub-cache" \
-            >> "$GITHUB_ENV"
+          echo "PUB_CACHE=$HOME/.pub-cache" >> "$GITHUB_ENV"
 
           echo "PUB_CACHE=$HOME/.pub-cache"
 
-      # ==========================================================
-      # 04 - DOWNLOAD
-      # ==========================================================
+      # =========================================================
+      # 04 DOWNLOAD ZIP
+      # =========================================================
 
       - name: "04 • Download source ZIP"
         env:
@@ -163,7 +152,7 @@ jobs:
             exit 1
           fi
 
-          echo "Downloading source ZIP..."
+          echo "Downloading source..."
 
           curl \
             --fail \
@@ -175,10 +164,13 @@ jobs:
             --max-time 900 \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/octet-stream" \
-            "${SOURCE_URL}" \
+            "$SOURCE_URL" \
             -o source.zip
 
-          test -f source.zip
+          if [ ! -f source.zip ]; then
+            echo "ERROR: source.zip tidak dibuat"
+            exit 1
+          fi
 
           SIZE="$(stat -c '%s' source.zip)"
 
@@ -190,9 +182,9 @@ jobs:
             exit 1
           fi
 
-      # ==========================================================
-      # 05 - ZIP VALIDATION
-      # ==========================================================
+      # =========================================================
+      # 05 VALIDATE ZIP
+      # =========================================================
 
       - name: "05 • Validate ZIP"
         shell: bash
@@ -210,23 +202,23 @@ jobs:
                   "ERROR: source.zip bukan ZIP valid"
               )
 
-          with zipfile.ZipFile(path) as archive:
+          with zipfile.ZipFile(path) as z:
 
-              bad = archive.testzip()
+              bad = z.testzip()
 
               if bad:
                   raise SystemExit(
                       f"ERROR: ZIP corrupt: {bad}"
                   )
 
-              for item in archive.infolist():
+              for item in z.infolist():
 
                   name = item.filename.replace("\\", "/")
                   parts = PurePosixPath(name).parts
 
                   if name.startswith("/"):
                       raise SystemExit(
-                          f"ERROR: absolute path: {name}"
+                          f"ERROR: absolute ZIP path: {name}"
                       )
 
                   if ".." in parts:
@@ -237,9 +229,9 @@ jobs:
           print("ZIP validation: OK")
           PY
 
-      # ==========================================================
-      # 06 - EXTRACT
-      # ==========================================================
+      # =========================================================
+      # 06 EXTRACT
+      # =========================================================
 
       - name: "06 • Extract source"
         shell: bash
@@ -253,7 +245,7 @@ jobs:
           echo "Source extracted."
 
           echo
-          echo "Flutter projects found:"
+          echo "Flutter projects:"
 
           find source \
             -type f \
@@ -261,9 +253,9 @@ jobs:
             -print \
             | head -30
 
-      # ==========================================================
-      # 07 - FIND PROJECT
-      # ==========================================================
+      # =========================================================
+      # 07 FIND FLUTTER PROJECT
+      # =========================================================
 
       - name: "07 • Locate Flutter project"
         shell: bash
@@ -296,7 +288,7 @@ jobs:
             echo "ERROR: Flutter project tidak ditemukan."
 
             echo
-            echo "pubspec.yaml yang ditemukan:"
+            echo "pubspec.yaml ditemukan:"
 
             find source \
               -type f \
@@ -314,13 +306,9 @@ jobs:
           echo "PROJECT_ROOT:"
           echo "$PROJECT_ROOT"
 
-      # ==========================================================
-      # 08 - FLUTTER REVISION
-      #
-      # IMPORTANT:
-      # Tidak menggunakan Python regex.
-      # Tidak ada quote escaping yang rawan syntax error.
-      # ==========================================================
+      # =========================================================
+      # 08 DETECT FLUTTER REVISION
+      # =========================================================
 
       - name: "08 • Detect original Flutter revision"
         shell: bash
@@ -330,6 +318,7 @@ jobs:
           cd "$PROJECT_ROOT"
 
           FLUTTER_REVISION=""
+          FLUTTER_CHANNEL=""
 
           if [ -f ".metadata" ]; then
 
@@ -338,7 +327,21 @@ jobs:
                 /^[[:space:]]+revision:/ {
                   value=$0
                   sub(/^[[:space:]]+revision:[[:space:]]*/, "", value)
-                  gsub(/["'\'']/, "", value)
+                  gsub(/"/, "", value)
+                  gsub(/\047/, "", value)
+                  print value
+                  exit
+                }
+              ' .metadata
+            )"
+
+            FLUTTER_CHANNEL="$(
+              awk '
+                /^[[:space:]]+channel:/ {
+                  value=$0
+                  sub(/^[[:space:]]+channel:[[:space:]]*/, "", value)
+                  gsub(/"/, "", value)
+                  gsub(/\047/, "", value)
                   print value
                   exit
                 }
@@ -348,55 +351,60 @@ jobs:
           fi
 
           FLUTTER_REVISION="$(
-            echo "$FLUTTER_REVISION" |
+            printf '%s' "$FLUTTER_REVISION" |
             tr -d '[:space:]'
           )"
 
-          echo "=========================================="
-          echo " FLUTTER REVISION DETECTION"
-          echo "=========================================="
+          FLUTTER_CHANNEL="$(
+            printf '%s' "$FLUTTER_CHANNEL" |
+            tr -d '[:space:]'
+          )"
 
-          if [ -n "$FLUTTER_REVISION" ]; then
-
-            echo "FOUND:"
-            echo "$FLUTTER_REVISION"
-
-          else
-
-            echo "NOT FOUND"
-
-          fi
-
-          echo
           echo "FLUTTER_REVISION=$FLUTTER_REVISION" \
             >> "$GITHUB_ENV"
 
-      # ==========================================================
-      # 09 - SETUP ORIGINAL FLUTTER
-      # ==========================================================
+          echo "FLUTTER_CHANNEL=$FLUTTER_CHANNEL" \
+            >> "$GITHUB_ENV"
 
-      - name: "09 • Setup original Flutter"
+          echo "=========================================="
+          echo " FLUTTER PROJECT INFORMATION"
+          echo "=========================================="
+          echo "Channel : ${FLUTTER_CHANNEL:-UNKNOWN}"
+          echo "Revision: ${FLUTTER_REVISION:-NOT FOUND}"
+          echo "=========================================="
+
+      # =========================================================
+      # 09 SETUP FLUTTER FROM GIT REVISION
+      #
+      # IMPORTANT:
+      # Revision = Git commit.
+      # Jangan gunakan channel stable di sini.
+      # =========================================================
+
+      - name: "09 • Setup original Flutter revision"
         if: env.FLUTTER_REVISION != ''
         uses: subosito/flutter-action@v2
         with:
+          channel: master
           flutter-version: ${{ env.FLUTTER_REVISION }}
-          channel: stable
           cache: true
+          pub-cache: true
 
-      # ==========================================================
-      # 10 - FALLBACK
-      # ==========================================================
+      # =========================================================
+      # 10 FALLBACK STABLE
+      # =========================================================
 
-      - name: "10 • Flutter stable fallback"
+      - name: "10 • Setup Flutter stable fallback"
         if: env.FLUTTER_REVISION == ''
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
+          pub-cache: true
 
-      # ==========================================================
-      # 11 - VERIFY FLUTTER
-      # ==========================================================
+      # =========================================================
+      # 11 VERIFY FLUTTER
+      # =========================================================
 
       - name: "11 • Verify Flutter"
         shell: bash
@@ -417,15 +425,19 @@ jobs:
 
           echo
           echo "Flutter root:"
-          echo "${FLUTTER_ROOT}"
+          echo "${FLUTTER_ROOT:-UNKNOWN}"
 
           echo
           echo "Requested revision:"
           echo "${FLUTTER_REVISION:-NONE}"
 
-      # ==========================================================
-      # 12 - DETECT GRADLE
-      # ==========================================================
+          echo
+          echo "Detected channel:"
+          echo "${FLUTTER_CHANNEL:-UNKNOWN}"
+
+      # =========================================================
+      # 12 DETECT GRADLE
+      # =========================================================
 
       - name: "12 • Detect Gradle"
         shell: bash
@@ -437,72 +449,85 @@ jobs:
           WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
 
           if [ ! -f "$WRAPPER" ]; then
-            echo "ERROR: Gradle wrapper tidak ditemukan"
+            echo "ERROR: Gradle wrapper tidak ditemukan:"
+            echo "$WRAPPER"
             exit 1
           fi
 
           GRADLE_VERSION="$(
             sed -nE \
-              's/.*gradle-([0-9]+([.][0-9]+){1,2})-.*/\1/p' \
+              's/.*gradle-([0-9]+([.][0-9]+){1,3})-.*/\1/p' \
               "$WRAPPER" \
               | head -n 1
           )"
 
-          if [ -z "$GRADLE_VERSION" ]; then
-            echo "WARNING: versi Gradle tidak terbaca"
-          fi
-
           echo "GRADLE_VERSION=$GRADLE_VERSION" \
             >> "$GITHUB_ENV"
 
-          echo "Gradle:"
+          echo "Gradle version:"
           echo "${GRADLE_VERSION:-UNKNOWN}"
 
-      # ==========================================================
-      # 13 - DETECT AGP
-      # ==========================================================
+      # =========================================================
+      # 13 DETECT AGP
+      # =========================================================
 
-      - name: "13 • Detect AGP"
+      - name: "13 • Detect Android Gradle Plugin"
         shell: bash
         run: |
           set -euo pipefail
 
           cd "$PROJECT_ROOT"
 
-          AGP_VERSION="$(
-            grep -RhoE \
-              'com\.android\.tools\.build:gradle:[0-9.]+' \
-              android \
-              2>/dev/null \
-              | head -n 1 \
-              | sed 's/.*://' \
-              || true
-          )"
+          AGP_VERSION=""
 
-          if [ -z "$AGP_VERSION" ]; then
+          if [ -f android/settings.gradle ]; then
+            AGP_VERSION="$(
+              grep -Eo \
+                'com\.android\.(application|library)[^"]*version[[:space:]]*["'\''][0-9.]+["'\'']' \
+                android/settings.gradle \
+                2>/dev/null \
+                | grep -Eo '[0-9]+([.][0-9]+)+' \
+                | head -n 1 \
+                || true
+            )"
+          fi
+
+          if [ -z "$AGP_VERSION" ] &&
+             [ -f android/settings.gradle.kts ]; then
 
             AGP_VERSION="$(
-              grep -RhoE \
-                'com\.android\.application[^[:space:]]*[[:space:]]*version[[:space:]]*["'\''][0-9.]+["'\'']' \
-                android \
+              grep -Eo \
+                'com\.android\.(application|library)[^"]*version[[:space:]]*["'\''][0-9.]+["'\'']' \
+                android/settings.gradle.kts \
                 2>/dev/null \
+                | grep -Eo '[0-9]+([.][0-9]+)+' \
                 | head -n 1 \
-                | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' \
-                | tail -n 1 \
                 || true
             )"
 
           fi
 
+          if [ -z "$AGP_VERSION" ]; then
+            AGP_VERSION="$(
+              grep -RhoE \
+                'com\.android\.tools\.build:gradle:[0-9.]+' \
+                android \
+                2>/dev/null \
+                | head -n 1 \
+                | cut -d: -f3 \
+                || true
+            )"
+          fi
+
           echo "AGP_VERSION=$AGP_VERSION" \
             >> "$GITHUB_ENV"
 
-          echo "AGP:"
+          echo "AGP version:"
           echo "${AGP_VERSION:-UNKNOWN}"
 
-      # ==========================================================
-      # 14 - DETECT KOTLIN
-      # ==========================================================
+      # =========================================================
+      # 14 DETECT KOTLIN
+      # =========================================================
 
       - name: "14 • Detect Kotlin"
         shell: bash
@@ -517,34 +542,32 @@ jobs:
               android \
               2>/dev/null \
               | head -n 1 \
-              | sed 's/.*://' \
+              | cut -d: -f2 \
               || true
           )"
 
           if [ -z "$KOTLIN_VERSION" ]; then
-
             KOTLIN_VERSION="$(
               grep -RhoE \
-                'kotlin.*version[[:space:]]*["'\''][0-9.]+["'\'']' \
+                'org\.jetbrains\.kotlin\.[a-zA-Z0-9_.-]+[^0-9]*[0-9]+\.[0-9]+(\.[0-9]+)?' \
                 android \
                 2>/dev/null \
+                | grep -Eo \
+                  '[0-9]+\.[0-9]+(\.[0-9]+)?' \
                 | head -n 1 \
-                | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' \
-                | tail -n 1 \
                 || true
             )"
-
           fi
 
           echo "KOTLIN_VERSION=$KOTLIN_VERSION" \
             >> "$GITHUB_ENV"
 
-          echo "Kotlin:"
+          echo "Kotlin version:"
           echo "${KOTLIN_VERSION:-UNKNOWN}"
 
-      # ==========================================================
-      # 15 - JAVA
-      # ==========================================================
+      # =========================================================
+      # 15 SELECT JAVA
+      # =========================================================
 
       - name: "15 • Select Java"
         shell: bash
@@ -554,12 +577,12 @@ jobs:
           VERSION="${GRADLE_VERSION:-}"
 
           MAJOR="$(
-            echo "$VERSION" |
+            printf '%s' "$VERSION" |
             cut -d. -f1
           )"
 
           MINOR="$(
-            echo "$VERSION" |
+            printf '%s' "$VERSION" |
             cut -d. -f2
           )"
 
@@ -586,9 +609,9 @@ jobs:
 
           echo "Selected Java: $JAVA_VERSION"
 
-      # ==========================================================
-      # 16 - JAVA SETUP
-      # ==========================================================
+      # =========================================================
+      # 16 SETUP JAVA
+      # =========================================================
 
       - name: "16 • Setup Java"
         uses: actions/setup-java@v5
@@ -596,9 +619,9 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
-      # ==========================================================
-      # 17 - TOOLCHAIN
-      # ==========================================================
+      # =========================================================
+      # 17 VERIFY JAVA / GRADLE
+      # =========================================================
 
       - name: "17 • Verify Android toolchain"
         shell: bash
@@ -624,9 +647,9 @@ jobs:
 
           ./gradlew --version
 
-      # ==========================================================
-      # 18 - BACKUP
-      # ==========================================================
+      # =========================================================
+      # 18 BACKUP
+      # =========================================================
 
       - name: "18 • Backup Android project"
         shell: bash
@@ -641,9 +664,9 @@ jobs:
 
           echo "Original Android project backed up."
 
-      # ==========================================================
-      # 19 - DIAGNOSTICS
-      # ==========================================================
+      # =========================================================
+      # 19 FLUTTER DIAGNOSTICS
+      # =========================================================
 
       - name: "19 • Flutter diagnostics"
         shell: bash
@@ -658,11 +681,11 @@ jobs:
           flutter analyze --suggestions \
             2>&1 | tee flutter_suggestions.log || true
 
-      # ==========================================================
-      # 20 - BUILD
-      # ==========================================================
+      # =========================================================
+      # 20 PUB GET + BUILD
+      # =========================================================
 
-      - name: "20 • Build original project"
+      - name: "20 • Build APK"
         shell: bash
         run: |
           set -o pipefail
@@ -672,7 +695,7 @@ jobs:
           rm -f flutter_build.log
 
           echo "=========================================="
-          echo " BUILD ORIGINAL PROJECT"
+          echo "        BUILD APK"
           echo "=========================================="
 
           echo
@@ -686,14 +709,20 @@ jobs:
           cd ..
 
           echo
+          echo "Java:"
+          java -version
+
+          echo
           echo "AGP    : ${AGP_VERSION:-UNKNOWN}"
           echo "Kotlin : ${KOTLIN_VERSION:-UNKNOWN}"
+          echo "Gradle : ${GRADLE_VERSION:-UNKNOWN}"
           echo "Java   : ${JAVA_VERSION}"
 
           echo
           echo "Running flutter pub get..."
 
-          flutter pub get
+          flutter pub get \
+            2>&1 | tee pub_get.log
 
           echo
           echo "Running APK build..."
@@ -701,37 +730,31 @@ jobs:
           case "$BUILD_TYPE" in
 
             debug)
-
               flutter build apk \
                 --debug \
                 --no-pub \
                 2>&1 | tee flutter_build.log
-
               ;;
 
             profile)
-
               flutter build apk \
                 --profile \
                 --no-pub \
                 2>&1 | tee flutter_build.log
-
               ;;
 
             release|*)
-
               flutter build apk \
                 --release \
                 --no-pub \
                 2>&1 | tee flutter_build.log
-
               ;;
 
           esac
 
-      # ==========================================================
-      # 21 - COLLECT APK
-      # ==========================================================
+      # =========================================================
+      # 21 FIND APK
+      # =========================================================
 
       - name: "21 • Collect APK"
         if: success()
@@ -750,12 +773,19 @@ jobs:
             -name "*.apk" \
             -exec cp {} "$GITHUB_WORKSPACE/output/" \;
 
-          if ! find "$GITHUB_WORKSPACE/output" \
+          APK_COUNT="$(
+            find "$GITHUB_WORKSPACE/output" \
               -type f \
               -name "*.apk" \
-              | grep -q .; then
+              | wc -l
+          )"
 
-            echo "ERROR: APK tidak ditemukan"
+          if [ "$APK_COUNT" -eq 0 ]; then
+
+            echo "ERROR: APK tidak ditemukan."
+
+            echo
+            echo "APK files:"
 
             find build \
               -type f \
@@ -768,15 +798,15 @@ jobs:
 
           echo
           echo "=========================================="
-          echo " APK SUCCESS"
+          echo " APK BUILD SUCCESS"
           echo "=========================================="
 
           ls -lh \
             "$GITHUB_WORKSPACE"/output/*.apk
 
-      # ==========================================================
-      # 22 - UPLOAD APK
-      # ==========================================================
+      # =========================================================
+      # 22 UPLOAD APK
+      # =========================================================
 
       - name: "22 • Upload APK"
         if: success()
@@ -789,9 +819,9 @@ jobs:
           compression-level: 0
           overwrite: true
 
-      # ==========================================================
-      # 23 - DIAGNOSTICS ARTIFACT
-      # ==========================================================
+      # =========================================================
+      # 23 UPLOAD DIAGNOSTICS
+      # =========================================================
 
       - name: "23 • Upload diagnostics"
         if: always()
@@ -800,6 +830,7 @@ jobs:
           name: diagnostics-${{ inputs.jobId }}
           path: |
             ${{ env.PROJECT_ROOT }}/flutter_build.log
+            ${{ env.PROJECT_ROOT }}/pub_get.log
             ${{ env.PROJECT_ROOT }}/flutter_doctor.log
             ${{ env.PROJECT_ROOT }}/flutter_suggestions.log
             ${{ env.PROJECT_ROOT }}/pubspec.yaml
