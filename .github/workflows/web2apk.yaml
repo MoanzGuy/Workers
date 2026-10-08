@@ -1,0 +1,319 @@
+name: Web to APK Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "ID unik build job"
+        required: true
+        type: string
+      userId:
+        description: "Telegram user ID"
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: "JSON payload"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  actions: write
+
+concurrency:
+  group: web2apk-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Parse payload
+        id: parse
+        shell: bash
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["PAYLOAD"])
+
+          url = str(payload.get("url", "")).strip()
+          app_name = str(payload.get("appName", "WebApp")).strip()
+          icon_url = str(payload.get("iconUrl", "")).strip()
+
+          job_id = str(
+              payload.get("jobId")
+              or payload.get("tag")
+              or os.environ.get("GITHUB_RUN_ID")
+          ).strip()
+
+          if not url:
+              raise SystemExit("url kosong di payload")
+
+          if not url.startswith(("http://", "https://")):
+              raise SystemExit("url harus menggunakan http:// atau https://")
+
+          if not app_name:
+              app_name = "WebApp"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"web_url={url}\n")
+              f.write(f"app_name={app_name}\n")
+              f.write(f"icon_url={icon_url}\n")
+              f.write(f"build_tag={job_id}\n")
+          PY
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Check tools
+        run: |
+          flutter --version
+          java -version
+
+      - name: Create Flutter project
+        run: |
+          set -euo pipefail
+
+          rm -rf webapp
+
+          flutter create \
+            --org com.scbuild.web2apk \
+            --project-name web2apk_app \
+            webapp
+
+      - name: Add WebView dependency
+        working-directory: webapp
+        run: |
+          flutter pub add webview_flutter
+
+      - name: Create main.dart
+        working-directory: webapp
+        run: |
+          cat > lib/main.dart <<'EOF'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          const webUrl = String.fromEnvironment(
+            'WEB_URL',
+            defaultValue: 'https://example.com',
+          );
+
+          const appName = String.fromEnvironment(
+            'APP_NAME',
+            defaultValue: 'WebApp',
+          );
+
+          void main() {
+            runApp(const WebApp());
+          }
+
+          class WebApp extends StatelessWidget {
+            const WebApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: appName,
+                theme: ThemeData(
+                  useMaterial3: true,
+                ),
+                home: const WebPage(),
+              );
+            }
+          }
+
+          class WebPage extends StatefulWidget {
+            const WebPage({super.key});
+
+            @override
+            State<WebPage> createState() => _WebPageState();
+          }
+
+          class _WebPageState extends State<WebPage> {
+            late final WebViewController controller;
+            bool loading = true;
+
+            @override
+            void initState() {
+              super.initState();
+
+              controller = WebViewController()
+                ..setJavaScriptMode(
+                  JavaScriptMode.unrestricted,
+                )
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onPageStarted: (_) {
+                      if (mounted) {
+                        setState(() => loading = true);
+                      }
+                    },
+                    onPageFinished: (_) {
+                      if (mounted) {
+                        setState(() => loading = false);
+                      }
+                    },
+                  ),
+                )
+                ..loadRequest(
+                  Uri.parse(webUrl),
+                );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: SafeArea(
+                  child: Stack(
+                    children: [
+                      WebViewWidget(
+                        controller: controller,
+                      ),
+
+                      if (loading)
+                        const Center(
+                          child: CircularProgressIndicator(),
+                        ),
+                    ],
+                  ),
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Set application name
+        working-directory: webapp
+        env:
+          APP_NAME: ${{ steps.parse.outputs.app_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from xml.sax.saxutils import escape
+
+          path = "android/app/src/main/AndroidManifest.xml"
+          name = escape(os.environ["APP_NAME"])
+
+          with open(path, "r", encoding="utf-8") as f:
+              data = f.read()
+
+          data, count = re.subn(
+              r'android:label="[^"]*"',
+              f'android:label="{name}"',
+              data,
+              count=1,
+          )
+
+          if count == 0:
+              raise SystemExit(
+                  "android:label tidak ditemukan"
+              )
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(data)
+          PY
+
+      - name: Install icon
+        if: ${{ steps.parse.outputs.icon_url != '' }}
+        working-directory: webapp
+        env:
+          ICON_URL: ${{ steps.parse.outputs.icon_url }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p assets/icon
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            --retry-delay 3 \
+            -o assets/icon/icon.png \
+            "$ICON_URL"
+
+          flutter pub add --dev flutter_launcher_icons
+
+          cat >> pubspec.yaml <<'EOF'
+
+          flutter_launcher_icons:
+            android: true
+            ios: false
+            image_path: "assets/icon/icon.png"
+          EOF
+
+          dart run flutter_launcher_icons
+
+      - name: Flutter pub get
+        working-directory: webapp
+        run: flutter pub get
+
+      - name: Build Web APK
+        working-directory: webapp
+        env:
+          WEB_URL: ${{ steps.parse.outputs.web_url }}
+          APP_NAME: ${{ steps.parse.outputs.app_name }}
+        run: |
+          set -euo pipefail
+
+          flutter build apk \
+            --release \
+            --dart-define="WEB_URL=$WEB_URL" \
+            --dart-define="APP_NAME=$APP_NAME"
+
+      - name: Collect APK
+        id: apk
+        shell: bash
+        env:
+          BUILD_TAG: ${{ steps.parse.outputs.build_tag }}
+        run: |
+          set -euo pipefail
+
+          APK="$(find webapp/build/app/outputs/apk -type f -name '*.apk' | sort | head -n 1 || true)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan."
+            find webapp/build -type f | head -100 || true
+            exit 1
+          fi
+
+          mkdir -p output
+
+          SAFE_TAG="$(echo "$BUILD_TAG" | tr -c 'A-Za-z0-9._-' '_')"
+
+          cp "$APK" "output/web2apk-${SAFE_TAG}.apk"
+
+          echo "name=web2apk-${SAFE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "path=output/web2apk-${SAFE_TAG}.apk" >> "$GITHUB_OUTPUT"
+
+          ls -lh output/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 1
