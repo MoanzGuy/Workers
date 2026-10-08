@@ -1,0 +1,221 @@
+name: Flutter Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "ID unik build job"
+        required: true
+        type: string
+      userId:
+        description: "Telegram user ID"
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: "JSON payload"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  actions: write
+
+concurrency:
+  group: flutter-build-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse payload
+        id: parse
+        shell: bash
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["PAYLOAD"])
+
+          url = str(payload.get("url", "")).strip()
+          tag = str(
+              payload.get("tag")
+              or payload.get("jobId")
+              or os.environ.get("GITHUB_RUN_ID")
+          ).strip()
+          build_type = str(payload.get("buildType", "release")).strip().lower()
+
+          if not url:
+              raise SystemExit("url kosong di payload")
+
+          if build_type not in ("release", "debug"):
+              build_type = "release"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"zip_url={url}\n")
+              f.write(f"tag={tag}\n")
+              f.write(f"build_type={build_type}\n")
+          PY
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: |
+          flutter --version
+          java -version
+
+      - name: Download source ZIP
+        env:
+          ZIP_URL: ${{ steps.parse.outputs.zip_url }}
+        run: |
+          set -euo pipefail
+
+          rm -f project.zip
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            --retry-delay 3 \
+            --connect-timeout 20 \
+            --max-time 600 \
+            -o project.zip \
+            "$ZIP_URL"
+
+          test -s project.zip
+
+          SIZE=$(stat -c%s project.zip)
+          echo "ZIP size: ${SIZE} bytes"
+
+          if [ "$SIZE" -lt 1000 ]; then
+            echo "::error::Source ZIP terlalu kecil."
+            exit 1
+          fi
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf project extracted
+          mkdir -p extracted project
+
+          unzip -q project.zip -d extracted
+
+          shopt -s dotglob nullglob
+
+          # Cari pubspec.yaml
+          PUBSPEC="$(find extracted -type f -name pubspec.yaml -print -quit)"
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan."
+            find extracted -maxdepth 3 -type f | head -100
+            exit 1
+          fi
+
+          PROJECT_ROOT="$(dirname "$PUBSPEC")"
+
+          echo "Project root: $PROJECT_ROOT"
+
+          cp -a "$PROJECT_ROOT"/. project/
+
+          test -f project/pubspec.yaml
+
+      - name: Prepare Flutter project
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter clean || true
+
+          # Jangan memaksa Gradle project lama secara membabi buta.
+          # Flutter yang terpasang akan menjadi acuan build.
+
+          flutter pub get
+
+      - name: Check Flutter project
+        working-directory: project
+        run: |
+          test -f pubspec.yaml
+          test -d android
+
+          echo "=== pubspec.yaml ==="
+          head -80 pubspec.yaml
+
+          echo "=== Gradle wrapper ==="
+          if [ -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            cat android/gradle/wrapper/gradle-wrapper.properties
+          fi
+
+      - name: Build APK
+        working-directory: project
+        env:
+          BUILD_TYPE: ${{ steps.parse.outputs.build_type }}
+        run: |
+          set -euo pipefail
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - name: Find APK
+        id: apk
+        shell: bash
+        env:
+          TAG: ${{ steps.parse.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          APK="$(find project/build/app/outputs/apk -type f -name '*.apk' 2>/dev/null | sort | head -n 1 || true)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan."
+            find project/build -type f | head -100 || true
+            exit 1
+          fi
+
+          mkdir -p output
+
+          SAFE_TAG="$(echo "$TAG" | tr -c 'A-Za-z0-9._-' '_')"
+
+          cp "$APK" "output/${SAFE_TAG}.apk"
+
+          echo "path=output/${SAFE_TAG}.apk" >> "$GITHUB_OUTPUT"
+          echo "name=${SAFE_TAG}" >> "$GITHUB_OUTPUT"
+
+          ls -lh output/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 1
