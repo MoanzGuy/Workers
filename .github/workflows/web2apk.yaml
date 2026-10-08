@@ -1,55 +1,56 @@
-name: Web2APK Build
+name: Web To APK
 
 on:
   workflow_dispatch:
     inputs:
       jobId:
-        description: "SC Build Job ID"
+        description: "Unique build job ID"
         required: true
         type: string
       userId:
-        description: "Telegram User ID"
+        description: "Telegram user ID"
         required: true
         type: string
       payload:
-        description: "SC Build JSON payload"
+        description: "Build payload JSON"
         required: true
         type: string
 
 permissions:
   contents: read
-  actions: write
+  actions: read
 
 concurrency:
   group: web2apk-${{ inputs.jobId }}
   cancel-in-progress: false
 
+env:
+  JAVA_VERSION: "17"
+
 jobs:
   build:
-    name: Build Web2APK
-    runs-on: ubuntu-latest
+    name: Web To APK Build
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
 
-    env:
-      JOB_ID: ${{ inputs.jobId }}
-      USER_ID: ${{ inputs.userId }}
-      PAYLOAD: ${{ inputs.payload }}
-
     steps:
-      - name: 01 - Initialize
+      - name: "01 • Worker information"
+        shell: bash
         run: |
           set -euo pipefail
-          echo "WEB TO APK BY ZIPERR"
-          echo "WEB2APK WORKER"
-          echo "Job ID : ${JOB_ID}"
-          echo "User ID: ${USER_ID}"
-          echo "Run ID : ${GITHUB_RUN_ID}"
 
-      - name: 02 - Parse payload
-        id: payload
+          echo "=========================================="
+          echo " WEB TO APK BY ZIPERR"
+          echo " Web2APK Worker"
+          echo "=========================================="
+          echo "Job ID : ${{ inputs.jobId }}"
+          echo "User ID: ${{ inputs.userId }}"
+          echo "=========================================="
+
+      - name: "02 • Parse payload"
         shell: bash
         env:
-          RAW_PAYLOAD: ${{ inputs.payload }}
+          BUILD_PAYLOAD: ${{ inputs.payload }}
         run: |
           set -euo pipefail
 
@@ -57,309 +58,488 @@ jobs:
           import json
           import os
 
-          data = json.loads(os.environ["RAW_PAYLOAD"])
+          raw = os.environ.get("BUILD_PAYLOAD", "").strip()
 
-          url = str(data.get("url", "")).strip()
+          if not raw:
+              raise SystemExit("ERROR: payload kosong")
+
+          try:
+              data = json.loads(raw)
+          except Exception as e:
+              raise SystemExit(
+                  f"ERROR: payload JSON invalid: {e}"
+              )
+
+          if not isinstance(data, dict):
+              raise SystemExit(
+                  "ERROR: payload harus berupa JSON object"
+              )
+
+          url = (
+              data.get("url")
+              or data.get("webUrl")
+              or data.get("web_url")
+              or data.get("website")
+              or data.get("site")
+          )
+
+          if not url:
+              raise SystemExit(
+                  "ERROR: URL website tidak ditemukan di payload"
+              )
+
+          url = str(url).strip()
+
+          if not (
+              url.startswith("http://")
+              or url.startswith("https://")
+          ):
+              raise SystemExit(
+                  "ERROR: URL website harus http:// atau https://"
+              )
+
           app_name = str(
               data.get("appName")
               or data.get("app_name")
-              or "WebApp"
+              or data.get("name")
+              or "Web APK"
           ).strip()
 
-          icon_url = str(
-              data.get("iconUrl")
-              or data.get("icon_url")
-              or ""
-          ).strip()
+          package_name = str(
+              data.get("packageName")
+              or data.get("package_name")
+              or "com.duta.webapk"
+          ).strip().lower()
 
-          tag = str(
-              data.get("jobId")
-              or data.get("tag")
-              or os.environ["GITHUB_RUN_ID"]
-          ).strip()
+          import re
 
-          if not url:
-              raise SystemExit("payload.url kosong")
+          if not re.fullmatch(
+              r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+",
+              package_name
+          ):
+              package_name = "com.duta.webapk"
 
-          if not url.startswith(("http://", "https://")):
-              raise SystemExit("payload.url harus http:// atau https://")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("WEB_URL=" + url + "\n")
+              f.write("APP_NAME=" + app_name.replace("\n", " ") + "\n")
+              f.write("PACKAGE_NAME=" + package_name + "\n")
 
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"url={url}\n")
-              f.write(f"app_name={app_name or 'WebApp'}\n")
-              f.write(f"icon_url={icon_url}\n")
-              f.write(f"tag={tag}\n")
+          print("Website URL : OK")
+          print("App name    :", app_name)
+          print("Package     :", package_name)
           PY
 
-      # Sama seperti Flutter:
-      # jangan gunakan Gradle cache sebelum project dibuat.
-      - name: 03 - Setup Java 17
+      - name: "03 • Setup Java 17"
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: 04 - Setup Flutter
+      - name: "04 • Verify Java"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "JAVA_HOME=$JAVA_HOME"
+
+          java -version
+          javac -version
+
+          test -x "$JAVA_HOME/bin/java"
+          test -x "$JAVA_HOME/bin/javac"
+
+      - name: "05 • Setup Flutter"
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: 05 - Verify tools
+      - name: "06 • Verify Flutter / Dart / Android"
+        shell: bash
         run: |
           set -euo pipefail
+
           flutter --version
-          java -version
+          dart --version
 
-      - name: 06 - Create Flutter project
+          flutter doctor -v
+
+          flutter precache --android
+
+          test -x "$(command -v flutter)"
+          test -x "$(command -v dart)"
+
+      - name: "07 • Create Flutter project"
+        shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf webapp
+          rm -rf project
 
           flutter create \
-            --org com.scbuild.web2apk \
-            --project-name web2apk_app \
-            webapp
+            --platforms=android \
+            --org="$PACKAGE_NAME" \
+            project
 
-      - name: 07 - Add WebView
-        working-directory: webapp
+          test -f project/pubspec.yaml
+          test -d project/android
+          test -d project/lib
+
+      - name: "08 • Add WebView dependency"
+        shell: bash
         run: |
           set -euo pipefail
+
+          cd project
+
           flutter pub add webview_flutter
 
-      - name: 08 - Create WebView app
-        working-directory: webapp
-        run: |
-          set -euo pipefail
+          flutter pub get
 
-          cat > lib/main.dart <<'EOF'
-          import 'package:flutter/material.dart';
-          import 'package:webview_flutter/webview_flutter.dart';
-
-          const webUrl = String.fromEnvironment(
-            'WEB_URL',
-            defaultValue: 'https://example.com',
-          );
-
-          void main() {
-            runApp(const Web2APK());
-          }
-
-          class Web2APK extends StatelessWidget {
-            const Web2APK({super.key});
-
-            @override
-            Widget build(BuildContext context) {
-              return MaterialApp(
-                debugShowCheckedModeBanner: false,
-                home: const BrowserPage(),
-              );
-            }
-          }
-
-          class BrowserPage extends StatefulWidget {
-            const BrowserPage({super.key});
-
-            @override
-            State<BrowserPage> createState() => _BrowserPageState();
-          }
-
-          class _BrowserPageState extends State<BrowserPage> {
-            late final WebViewController controller;
-            bool loading = true;
-
-            @override
-            void initState() {
-              super.initState();
-
-              controller = WebViewController()
-                ..setJavaScriptMode(
-                  JavaScriptMode.unrestricted,
-                )
-                ..setNavigationDelegate(
-                  NavigationDelegate(
-                    onPageStarted: (_) {
-                      if (mounted) {
-                        setState(() {
-                          loading = true;
-                        });
-                      }
-                    },
-                    onPageFinished: (_) {
-                      if (mounted) {
-                        setState(() {
-                          loading = false;
-                        });
-                      }
-                    },
-                  ),
-                )
-                ..loadRequest(
-                  Uri.parse(webUrl),
-                );
-            }
-
-            @override
-            Widget build(BuildContext context) {
-              return Scaffold(
-                body: SafeArea(
-                  child: Stack(
-                    children: [
-                      WebViewWidget(
-                        controller: controller,
-                      ),
-                      if (loading)
-                        const Center(
-                          child: CircularProgressIndicator(),
-                        ),
-                    ],
-                  ),
-                ),
-              );
-            }
-          }
-          EOF
-
-      - name: 09 - Set application name
-        working-directory: webapp
+      - name: "09 • Generate application"
+        shell: bash
         env:
-          APP_NAME: ${{ steps.payload.outputs.app_name }}
+          GENERATED_URL: ${{ env.WEB_URL }}
+          GENERATED_APP_NAME: ${{ env.APP_NAME }}
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
+          import json
           import os
-          import re
-          from xml.sax.saxutils import escape
 
-          path = "android/app/src/main/AndroidManifest.xml"
-          name = escape(os.environ.get("APP_NAME", "WebApp"))
+          url = os.environ["GENERATED_URL"]
+          app_name = os.environ["GENERATED_APP_NAME"]
 
-          with open(path, "r", encoding="utf-8") as f:
-              data = f.read()
+          # json.dumps menghasilkan Dart string literal yang aman
+          dart_url = json.dumps(url, ensure_ascii=False)
+          dart_name = json.dumps(app_name, ensure_ascii=False)
 
-          data, count = re.subn(
-              r'android:label="[^"]*"',
-              f'android:label="{name}"',
-              data,
-              count=1,
-          )
+          code = f'''import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
 
-          if count == 0:
-              raise SystemExit("android:label tidak ditemukan")
+          void main() {{
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const WebApp());
+          }}
 
-          with open(path, "w", encoding="utf-8") as f:
-              f.write(data)
+          class WebApp extends StatefulWidget {{
+            const WebApp({{super.key}});
+
+            @override
+            State<WebApp> createState() => _WebAppState();
+          }}
+
+          class _WebAppState extends State<WebApp> {{
+            late final WebViewController controller;
+
+            @override
+            void initState() {{
+              super.initState();
+
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onWebResourceError: (error) {{
+                      debugPrint(
+                        'Web error: ${{error.description}}',
+                      );
+                    }},
+                  ),
+                )
+                ..loadRequest(
+                  Uri.parse({dart_url}),
+                );
+            }}
+
+            @override
+            Widget build(BuildContext context) {{
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: {dart_name},
+                home: Scaffold(
+                  body: SafeArea(
+                    child: WebViewWidget(
+                      controller: controller,
+                    ),
+                  ),
+                ),
+              );
+            }}
+          }}
+          '''
+
+          os.makedirs("project/lib", exist_ok=True)
+
+          with open(
+              "project/lib/main.dart",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write(code)
+
+          print("main.dart generated")
           PY
 
-      - name: 10 - Install icon
-        if: ${{ steps.payload.outputs.icon_url != '' }}
-        working-directory: webapp
-        env:
-          ICON_URL: ${{ steps.payload.outputs.icon_url }}
+      - name: "10 • Verify AndroidManifest"
+        shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p assets/icon
+          cd project
 
-          curl \
-            --fail \
-            --show-error \
-            --location \
-            --retry 5 \
-            --retry-all-errors \
-            --retry-delay 3 \
-            --connect-timeout 30 \
-            --max-time 300 \
-            -o assets/icon/icon.png \
-            "${ICON_URL}"
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
 
-          test -s assets/icon/icon.png
+          python3 - "$MANIFEST" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
 
-          flutter pub add --dev flutter_launcher_icons
+          path = sys.argv[1]
 
-          cat >> pubspec.yaml <<'EOF'
+          try:
+              tree = ET.parse(path)
+          except Exception as e:
+              raise SystemExit(
+                  f"ERROR: AndroidManifest.xml invalid: {e}"
+              )
 
-          flutter_launcher_icons:
-            android: true
-            ios: false
-            image_path: "assets/icon/icon.png"
-          EOF
+          root = tree.getroot()
+
+          if root.tag != "manifest":
+              raise SystemExit(
+                  "ERROR: AndroidManifest root invalid"
+              )
+
+          android_ns = "http://schemas.android.com/apk/res/android"
+          permission = (
+              "{"
+              + android_ns
+              + "}name"
+          )
+
+          internet = "android.permission.INTERNET"
+
+          exists = False
+
+          for node in root.findall("uses-permission"):
+              if node.get(permission) == internet:
+                  exists = True
+                  break
+
+          if not exists:
+              ET.register_namespace("android", android_ns)
+
+              node = ET.Element(
+                  "uses-permission",
+                  {
+                      permission: internet
+                  }
+              )
+
+              root.insert(0, node)
+              tree.write(
+                  path,
+                  encoding="utf-8",
+                  xml_declaration=True
+              )
+
+              print("INTERNET permission added")
+          else:
+              print("INTERNET permission already exists")
+          PY
+
+          grep -q "android.permission.INTERNET" "$MANIFEST"
+
+      - name: "11 • Repair Gradle wrapper"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd project
+
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+
+          test -f "$WRAPPER"
+
+          CURRENT="$(
+            python3 - "$WRAPPER" <<'PY'
+          import re
+          import sys
+
+          text = open(
+              sys.argv[1],
+              encoding="utf-8"
+          ).read()
+
+          m = re.search(
+              r"distributionUrl=.*gradle-([0-9]+(?:\.[0-9]+){1,2})-",
+              text
+          )
+
+          print(m.group(1) if m else "")
+          PY
+          )"
+
+          echo "Current Gradle: ${CURRENT:-unknown}"
+
+          python3 - "$WRAPPER" "$CURRENT" <<'PY'
+          import re
+          import sys
+
+          path = sys.argv[1]
+          current = sys.argv[2]
+
+          def version(s):
+              try:
+                  return tuple(
+                      int(x)
+                      for x in s.split(".")
+                  )
+              except Exception:
+                  return (0,)
+
+          minimum = version("8.14.0")
+          current_v = (
+              version(current)
+              if current
+              else (0,)
+          )
+
+          if current_v < minimum:
+              text = open(
+                  path,
+                  encoding="utf-8"
+              ).read()
+
+              text = re.sub(
+                  r"gradle-[0-9]+(?:\.[0-9]+){1,2}-",
+                  "gradle-8.14.3-",
+                  text
+              )
+
+              open(
+                  path,
+                  "w",
+                  encoding="utf-8"
+              ).write(text)
+
+              print(
+                  "Gradle wrapper patched to 8.14.3"
+              )
+          else:
+              print(
+                  "Gradle wrapper already compatible"
+              )
+          PY
+
+          chmod +x android/gradlew
+
+          ./android/gradlew --version
+
+      - name: "12 • Flutter clean"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd project
+
+          flutter clean
+
+      - name: "13 • Flutter dependencies"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd project
 
           flutter pub get
-          dart run flutter_launcher_icons
 
-      - name: 11 - Flutter pub get
-        working-directory: webapp
+      - name: "14 • Final preflight"
+        shell: bash
         run: |
           set -euo pipefail
-          flutter pub get
 
-      - name: 12 - Build Web2APK
-        working-directory: webapp
-        env:
-          WEB_URL: ${{ steps.payload.outputs.url }}
+          cd project
+
+          test -f pubspec.yaml
+          test -f lib/main.dart
+          test -d android
+          test -f android/gradlew
+          test -f android/app/src/main/AndroidManifest.xml
+
+          flutter --version
+          dart --version
+
+          ./android/gradlew --version
+
+          flutter analyze lib/main.dart
+
+          echo "Web2APK preflight: PASSED"
+
+      - name: "15 • Build APK"
+        shell: bash
         run: |
-          set -euo pipefail
+          set -o pipefail
+
+          cd project
+
+          rm -f flutter_build.log
 
           flutter build apk \
             --release \
-            --dart-define="WEB_URL=${WEB_URL}"
+            --no-pub \
+            2>&1 | tee flutter_build.log
 
-      - name: 13 - Collect APK
-        id: apk
-        env:
-          TAG: ${{ steps.payload.outputs.tag }}
+      - name: "16 • Collect APK"
+        if: success()
+        shell: bash
         run: |
           set -euo pipefail
 
-          APK="$(
-            find webapp/build/app/outputs \
+          mkdir -p output
+
+          find project/build/app/outputs/apk \
+            -type f \
+            -name "*.apk" \
+            -exec cp {} output/ \;
+
+          if ! find output \
               -type f \
               -name "*.apk" \
-              -print \
-              | sort \
-              | head -n 1
-          )"
-
-          if [ -z "${APK}" ]; then
-            echo "::error::APK tidak ditemukan."
+              | grep -q .; then
+            echo "ERROR: APK tidak ditemukan"
+            find project/build \
+              -type f \
+              | head -n 100
             exit 1
           fi
 
-          mkdir -p output
+          ls -lh output/*.apk
 
-          SAFE_TAG="$(
-            echo "${TAG}" |
-            tr -c 'A-Za-z0-9._-' '_'
-          )"
-
-          DEST="output/web2apk-${SAFE_TAG}.apk"
-
-          cp "${APK}" "${DEST}"
-
-          echo "path=${DEST}" >> "${GITHUB_OUTPUT}"
-          echo "name=web2apk-${SAFE_TAG}" >> "${GITHUB_OUTPUT}"
-
-          ls -lh "${DEST}"
-
-      - name: 14 - Upload APK
+      - name: "17 • Upload APK"
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.apk.outputs.name }}
-          path: ${{ steps.apk.outputs.path }}
+          name: apk-${{ inputs.jobId }}
+          path: output/*.apk
           if-no-files-found: error
           retention-days: 2
           compression-level: 0
+          overwrite: true
 
-      - name: 15 - Upload diagnostics
-        if: failure()
+      - name: "18 • Upload diagnostics"
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: diagnostics-${{ inputs.jobId }}
           path: |
-            webapp/build
-            webapp/android
+            project/flutter_build.log
+            project/pubspec.yaml
+            project/pubspec.lock
+            project/android/gradle/wrapper/gradle-wrapper.properties
+            project/android/app/src/main/AndroidManifest.xml
           if-no-files-found: warn
           retention-days: 2
+          compression-level: 0
+          overwrite: true
