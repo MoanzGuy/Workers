@@ -1,335 +1,572 @@
-name: Flutter Build APK
+name: Flutter Build
 
 on:
   workflow_dispatch:
     inputs:
       jobId:
-        description: "SC Build Job ID"
+        description: "Unique build job ID"
         required: true
         type: string
-
       userId:
-        description: "Telegram User ID"
+        description: "Telegram user ID"
         required: true
         type: string
-
       payload:
-        description: "SC Build JSON payload"
+        description: "Build payload JSON"
         required: true
         type: string
 
 permissions:
   contents: read
-  actions: write
+  actions: read
 
 concurrency:
-  group: flutter-${{ inputs.jobId }}
+  group: flutter-build-${{ inputs.jobId }}
   cancel-in-progress: false
+
+env:
+  FLUTTER_CHANNEL: stable
+  JAVA_VERSION: "17"
+  GRADLE_MIN_VERSION: "8.14.0"
 
 jobs:
   build:
-    name: Build Flutter APK
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-
-    env:
-      JOB_ID: ${{ inputs.jobId }}
-      USER_ID: ${{ inputs.userId }}
-      PAYLOAD: ${{ inputs.payload }}
-      FLUTTER_CHANNEL: stable
-      JAVA_VERSION: "17"
+    name: Flutter APK Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
 
     steps:
-
-      - name: 01 - Initialize
+      - name: "01 • Worker information"
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "============================================"
+          echo "=========================================="
           echo " WEB TO APK BY ZIPERR"
-          echo " FLUTTER BUILD WORKER"
-          echo "============================================"
+          echo " Flutter Build Worker"
+          echo "=========================================="
+          echo "Job ID : ${{ inputs.jobId }}"
+          echo "User ID: ${{ inputs.userId }}"
+          echo "Runner : $RUNNER_OS"
+          echo "Arch   : $RUNNER_ARCH"
+          echo "=========================================="
 
-          echo "Job ID : ${JOB_ID}"
-          echo "User ID: ${USER_ID}"
-          echo "Run ID : ${GITHUB_RUN_ID}"
-          echo "Workspace: ${GITHUB_WORKSPACE}"
-
-      - name: 02 - Parse payload
-        id: payload
+      - name: "02 • Parse build payload"
         shell: bash
         env:
-          RAW_PAYLOAD: ${{ inputs.payload }}
+          BUILD_PAYLOAD: ${{ inputs.payload }}
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           import json
           import os
+          import sys
 
-          raw = os.environ.get("RAW_PAYLOAD", "").strip()
+          raw = os.environ.get("BUILD_PAYLOAD", "").strip()
 
           if not raw:
-              raise SystemExit("payload kosong")
+              raise SystemExit("ERROR: payload kosong")
 
           try:
               data = json.loads(raw)
           except Exception as e:
-              raise SystemExit(f"payload JSON tidak valid: {e}")
+              raise SystemExit(f"ERROR: payload bukan JSON valid: {e}")
 
-          url = str(data.get("url", "")).strip()
+          if not isinstance(data, dict):
+              raise SystemExit("ERROR: payload harus berupa object JSON")
 
-          tag = str(
-              data.get("tag")
-              or data.get("jobId")
-              or os.environ.get("GITHUB_RUN_ID")
-          ).strip()
+          url = (
+              data.get("url")
+              or data.get("sourceUrl")
+              or data.get("source_url")
+              or data.get("zipUrl")
+              or data.get("zip_url")
+          )
+
+          if not url:
+              raise SystemExit(
+                  "ERROR: URL source ZIP tidak ditemukan di payload"
+              )
 
           build_type = str(
               data.get("buildType")
+              or data.get("build_type")
+              or data.get("type")
               or "release"
-          ).strip().lower()
+          ).lower().strip()
 
-          if not url:
-              raise SystemExit("payload.url kosong")
-
-          if not url.startswith(("http://", "https://")):
-              raise SystemExit("payload.url harus http:// atau https://")
-
-          if build_type not in ("release", "debug"):
+          if build_type not in ("release", "debug", "profile"):
               build_type = "release"
 
-          with open(
-              os.environ["GITHUB_OUTPUT"],
-              "a",
-              encoding="utf-8"
-          ) as f:
-              f.write(f"url={url}\n")
-              f.write(f"tag={tag}\n")
-              f.write(f"build_type={build_type}\n")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("SOURCE_URL=" + str(url) + "\n")
+              f.write("BUILD_TYPE=" + build_type + "\n")
 
-          print("Payload OK")
-          print("URL:", url)
-          print("Tag:", tag)
+          print("Payload valid")
           print("Build type:", build_type)
+          print("Source URL ditemukan")
           PY
 
-      - name: 03 - Setup Java 17
+      - name: "03 • Setup Java 17"
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: 04 - Setup Flutter
+      - name: "04 • Verify Java"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
+          javac -version
+
+          test -x "$JAVA_HOME/bin/java"
+          test -x "$JAVA_HOME/bin/javac"
+
+      - name: "05 • Setup Flutter"
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: 05 - Verify tools
+      - name: "06 • Verify Flutter / Dart / Android"
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "Flutter:"
           flutter --version
-          java -version
 
-      - name: 06 - Download source ZIP
+          echo
+          echo "Dart:"
+          dart --version
+
+          echo
+          echo "Flutter doctor:"
+          flutter doctor -v
+
+          echo
+          echo "Flutter Android artifacts:"
+          flutter precache --android
+
+          test -x "$(command -v flutter)"
+          test -x "$(command -v dart)"
+
+      - name: "07 • Verify system tools"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 --version
+          git --version
+          curl --version
+          unzip -v | head -n 2
+
+      - name: "08 • Download source ZIP"
         shell: bash
         env:
-          SOURCE_URL: ${{ steps.payload.outputs.url }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          rm -f source.zip
+          rm -rf source.zip source project
+          mkdir -p project
 
-          curl \
-            --fail \
-            --show-error \
-            --location \
-            --retry 6 \
-            --retry-all-errors \
-            --retry-delay 3 \
-            --connect-timeout 30 \
-            --max-time 900 \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/octet-stream" \
-            -o source.zip \
-            "${SOURCE_URL}"
+          if [ -z "${SOURCE_URL:-}" ]; then
+            echo "ERROR: SOURCE_URL kosong"
+            exit 1
+          fi
 
-          test -s source.zip
+          echo "Downloading source ZIP..."
+
+          URL_HOST="$(python3 - <<'PY'
+          import os
+          from urllib.parse import urlparse
+
+          u = os.environ.get("SOURCE_URL", "")
+          print(urlparse(u).netloc.lower())
+          PY
+          )"
+
+          if [[ "$URL_HOST" == "github.com" || "$URL_HOST" == "api.github.com" ]]; then
+            curl \
+              --fail \
+              --show-error \
+              --location \
+              --retry 5 \
+              --retry-delay 2 \
+              --connect-timeout 30 \
+              --max-time 600 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              "$SOURCE_URL" \
+              -o source.zip
+          else
+            curl \
+              --fail \
+              --show-error \
+              --location \
+              --retry 5 \
+              --retry-delay 2 \
+              --connect-timeout 30 \
+              --max-time 600 \
+              "$SOURCE_URL" \
+              -o source.zip
+          fi
+
+          test -f source.zip
 
           SIZE="$(stat -c%s source.zip)"
 
-          echo "Source ZIP: ${SIZE} bytes"
+          echo "ZIP size: ${SIZE} bytes"
 
-          if [ "${SIZE}" -lt 1000 ]; then
-            echo "::error::Source ZIP terlalu kecil."
+          if [ "$SIZE" -lt 1024 ]; then
+            echo "ERROR: source.zip terlalu kecil"
+            file source.zip || true
+            head -c 500 source.zip || true
             exit 1
           fi
 
-      - name: 07 - Extract source
+          file source.zip
+
+      - name: "09 • Validate ZIP"
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf extracted project
+          python3 - <<'PY'
+          import zipfile
+          import sys
+          from pathlib import PurePosixPath
 
-          mkdir -p extracted
+          path = "source.zip"
+
+          if not zipfile.is_zipfile(path):
+              raise SystemExit("ERROR: source.zip bukan ZIP valid")
+
+          with zipfile.ZipFile(path, "r") as z:
+              bad = z.testzip()
+
+              if bad:
+                  raise SystemExit(
+                      f"ERROR: ZIP corrupt pada file: {bad}"
+                  )
+
+              for info in z.infolist():
+                  name = info.filename.replace("\\", "/")
+                  p = PurePosixPath(name)
+
+                  if name.startswith("/"):
+                      raise SystemExit(
+                          f"ERROR: ZIP memiliki absolute path: {name}"
+                      )
+
+                  if ".." in p.parts:
+                      raise SystemExit(
+                          f"ERROR: ZIP memiliki path traversal: {name}"
+                      )
+
+              print("ZIP validation: OK")
+              print("Files:", len(z.infolist()))
+          PY
+
+      - name: "10 • Extract source ZIP"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf source
+          mkdir -p source
+
+          unzip -q source.zip -d source
+
+          test -d source
+
+          echo "Extracted:"
+          find source -maxdepth 2 -type f | head -n 50
+
+      - name: "11 • Locate Flutter project"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_ROOT=""
+
+          while IFS= read -r pubspec; do
+            DIR="$(dirname "$pubspec")"
+
+            if [ -f "$DIR/pubspec.yaml" ] \
+              && [ -d "$DIR/lib" ] \
+              && [ -d "$DIR/android" ]; then
+              PROJECT_ROOT="$DIR"
+              break
+            fi
+          done < <(find "$PWD/source" -type f -name pubspec.yaml | sort)
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "ERROR: Flutter project tidak ditemukan."
+            echo
+            echo "pubspec.yaml yang ditemukan:"
+            find "$PWD/source" -type f -name pubspec.yaml -print || true
+            exit 1
+          fi
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Flutter project:"
+          echo "$PROJECT_ROOT"
+
+      - name: "12 • Prepare project"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf project
           mkdir -p project
 
-          unzip -q source.zip -d extracted
-
-          PUBSPEC="$(
-            find extracted \
-              -type f \
-              -name "pubspec.yaml" \
-              -print \
-              | head -n 1
-          )"
-
-          if [ -z "${PUBSPEC}" ]; then
-            echo "::error::pubspec.yaml tidak ditemukan."
-
-            find extracted \
-              -maxdepth 5 \
-              -type f \
-              | head -200
-
-            exit 1
-          fi
-
-          PROJECT_ROOT="$(dirname "${PUBSPEC}")"
-
-          echo "Project root: ${PROJECT_ROOT}"
-
-          cp -a "${PROJECT_ROOT}/." project/
+          cp -a "$PROJECT_ROOT"/. project/
 
           test -f project/pubspec.yaml
+          test -d project/lib
           test -d project/android
+          test -f project/android/app/build.gradle \
+            || test -f project/android/app/build.gradle.kts
 
-          echo "Flutter project OK."
+          test -f project/android/app/src/main/AndroidManifest.xml
 
-      - name: 08 - Prepare Flutter project
-        working-directory: project
-        shell: bash
-        env:
-          PROJECT_DIR: ${{ github.workspace }}/project
-        run: |
-          set -Eeuo pipefail
+          cd project
 
-          SCRIPT="${GITHUB_WORKSPACE}/scripts/build_flutter.sh"
+          echo "Project prepared:"
+          pwd
 
-          echo "Worker script:"
-          echo "${SCRIPT}"
+          echo
+          echo "pubspec.yaml:"
+          head -n 40 pubspec.yaml
 
-          if [ ! -f "${SCRIPT}" ]; then
-            echo "::error::build_flutter.sh tidak ditemukan."
-
-            find "${GITHUB_WORKSPACE}" \
-              -maxdepth 4 \
-              -type f \
-              | sort
-
-            exit 1
-          fi
-
-          chmod +x "${SCRIPT}"
-
-          "${SCRIPT}" prepare
-
-      - name: 09 - Flutter dependencies
-        working-directory: project
+      - name: "13 • Repair Gradle wrapper"
         shell: bash
         run: |
           set -euo pipefail
+
+          cd project
+
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+
+          if [ ! -f "$WRAPPER" ]; then
+            echo "ERROR: Gradle wrapper tidak ditemukan"
+            exit 1
+          fi
+
+          CURRENT="$(
+            python3 - "$WRAPPER" <<'PY'
+          import re
+          import sys
+
+          p = sys.argv[1]
+          text = open(p, encoding="utf-8").read()
+
+          m = re.search(
+              r"distributionUrl=.*gradle-([0-9]+(?:\.[0-9]+){1,2})-",
+              text
+          )
+
+          print(m.group(1) if m else "")
+          PY
+          )"
+
+          echo "Current Gradle: ${CURRENT:-unknown}"
+
+          python3 - "$WRAPPER" "$CURRENT" <<'PY'
+          import re
+          import sys
+
+          path = sys.argv[1]
+          current = sys.argv[2]
+
+          def ver(s):
+              try:
+                  return tuple(int(x) for x in s.split("."))
+              except Exception:
+                  return (0,)
+
+          minimum = ver("8.14.0")
+          current_v = ver(current) if current else (0,)
+
+          if current_v < minimum:
+              text = open(path, encoding="utf-8").read()
+
+              text = re.sub(
+                  r"gradle-[0-9]+(?:\.[0-9]+){1,2}-",
+                  "gradle-8.14.3-",
+                  text
+              )
+
+              open(path, "w", encoding="utf-8").write(text)
+
+              print("Gradle wrapper patched to 8.14.3")
+          else:
+              print("Gradle wrapper already compatible")
+          PY
+
+          chmod +x android/gradlew
+
+          ./android/gradlew --version
+
+      - name: "14 • Check AndroidManifest"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd project
+
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+
+          python3 - "$MANIFEST" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path = sys.argv[1]
+
+          try:
+              tree = ET.parse(path)
+          except Exception as e:
+              raise SystemExit(
+                  f"ERROR: AndroidManifest.xml invalid: {e}"
+              )
+
+          root = tree.getroot()
+
+          if root.tag != "manifest":
+              raise SystemExit(
+                  "ERROR: AndroidManifest root bukan <manifest>"
+              )
+
+          print("AndroidManifest.xml: OK")
+          PY
+
+      - name: "15 • Flutter clean"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd project
+
+          flutter clean
+
+      - name: "16 • Flutter dependencies"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd project
 
           flutter pub get
 
-      - name: 10 - Build APK
-        working-directory: project
-        env:
-          PROJECT_DIR: ${{ github.workspace }}/project
-          BUILD_TYPE: ${{ steps.payload.outputs.build_type }}
+      - name: "17 • Final worker preflight"
         shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          SCRIPT="${GITHUB_WORKSPACE}/scripts/build_flutter.sh"
-
-          if [ ! -f "${SCRIPT}" ]; then
-            echo "::error::build_flutter.sh tidak ditemukan."
-            exit 1
-          fi
-
-          chmod +x "${SCRIPT}"
-
-          "${SCRIPT}" build
-
-      - name: 11 - Collect APK
-        id: apk
-        shell: bash
-        env:
-          TAG: ${{ steps.payload.outputs.tag }}
         run: |
           set -euo pipefail
 
-          APK="$(
-            find project/build/app/outputs \
-              -type f \
-              -name "*.apk" \
-              -print \
-              | sort \
-              | head -n 1
-          )"
+          cd project
 
-          if [ -z "${APK}" ]; then
-            echo "::error::APK tidak ditemukan."
+          test -f pubspec.yaml
+          test -d lib
+          test -d android
+          test -f android/gradlew
+          test -f android/app/src/main/AndroidManifest.xml
 
-            find project/build \
-              -type f \
-              -name "*.apk" \
-              -print \
-              2>/dev/null || true
+          echo "Flutter:"
+          flutter --version
 
-            exit 1
-          fi
+          echo
+          echo "Dart:"
+          dart --version
+
+          echo
+          echo "Gradle:"
+          ./android/gradlew --version
+
+          echo
+          echo "Preflight: PASSED"
+
+      - name: "18 • Build APK"
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+
+          cd project
+
+          rm -f flutter_build.log
+
+          case "$BUILD_TYPE" in
+            debug)
+              flutter build apk \
+                --debug \
+                --no-pub \
+                2>&1 | tee flutter_build.log
+              ;;
+            profile)
+              flutter build apk \
+                --profile \
+                --no-pub \
+                2>&1 | tee flutter_build.log
+              ;;
+            *)
+              flutter build apk \
+                --release \
+                --no-pub \
+                2>&1 | tee flutter_build.log
+              ;;
+          esac
+
+      - name: "19 • Collect APK"
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
 
           mkdir -p output
 
-          SAFE_TAG="$(
-            echo "${TAG}" |
-            tr -c 'A-Za-z0-9._-' '_'
-          )"
+          find project/build/app/outputs/apk \
+            -type f \
+            -name "*.apk" \
+            -exec cp {} output/ \;
 
-          DEST="output/flutter-${SAFE_TAG}.apk"
+          if ! find output -type f -name "*.apk" | grep -q .; then
+            echo "ERROR: APK tidak ditemukan"
+            find project/build -type f | head -n 100
+            exit 1
+          fi
 
-          cp "${APK}" "${DEST}"
+          echo "APK generated:"
+          ls -lh output/*.apk
 
-          echo "path=${DEST}" >> "${GITHUB_OUTPUT}"
-          echo "name=flutter-${SAFE_TAG}" >> "${GITHUB_OUTPUT}"
-
-          ls -lh "${DEST}"
-
-      - name: 12 - Upload APK
+      - name: "20 • Upload APK"
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.apk.outputs.name }}
-          path: ${{ steps.apk.outputs.path }}
+          name: apk-${{ inputs.jobId }}
+          path: output/*.apk
           if-no-files-found: error
           retention-days: 2
           compression-level: 0
+          overwrite: true
 
-      - name: 13 - Upload diagnostics
-        if: failure()
+      - name: "21 • Upload diagnostics"
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: diagnostics-${{ inputs.jobId }}
           path: |
-            ${{ github.workspace }}/project/flutter_build.log
-            ${{ github.workspace }}/project/build
+            project/flutter_build.log
+            project/pubspec.yaml
+            project/pubspec.lock
+            project/android/gradle/wrapper/gradle-wrapper.properties
+            project/android/app/src/main/AndroidManifest.xml
           if-no-files-found: warn
           retention-days: 2
           compression-level: 0
+          overwrite: true
