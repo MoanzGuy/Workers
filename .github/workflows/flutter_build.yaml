@@ -18,29 +18,28 @@ permissions:
   actions: read
 
 concurrency:
-  group: flutter-build-${{ inputs.jobId }}
+  group: flutter-${{ inputs.jobId }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Adaptive Flutter APK Build
-    runs-on: ubuntu-24.04
+    name: Adaptive Flutter APK
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
 
     steps:
 
-      - name: "01 • Worker"
+      - name: "01 • Worker start"
         shell: bash
         run: |
           set -euo pipefail
 
           echo "=========================================="
           echo " WEB TO APK BY ZIPERR"
-          echo " ADAPTIVE FLUTTER BUILD WORKER"
+          echo " ADAPTIVE FLUTTER WORKER"
           echo "=========================================="
           echo "Job ID : ${{ inputs.jobId }}"
           echo "User ID: ${{ inputs.userId }}"
-          echo "Runner : $RUNNER_OS"
           echo "=========================================="
 
       - name: "02 • Parse payload"
@@ -53,7 +52,6 @@ jobs:
           python3 - <<'PY'
           import json
           import os
-          import re
 
           raw = os.environ.get("PAYLOAD", "").strip()
 
@@ -63,10 +61,14 @@ jobs:
           try:
               data = json.loads(raw)
           except Exception as e:
-              raise SystemExit(f"ERROR: payload JSON invalid: {e}")
+              raise SystemExit(
+                  f"ERROR: payload JSON invalid: {e}"
+              )
 
           if not isinstance(data, dict):
-              raise SystemExit("ERROR: payload harus object JSON")
+              raise SystemExit(
+                  "ERROR: payload harus object JSON"
+              )
 
           url = (
               data.get("url")
@@ -77,26 +79,32 @@ jobs:
           )
 
           if not url:
-              raise SystemExit("ERROR: source ZIP URL tidak ditemukan")
+              raise SystemExit(
+                  "ERROR: source ZIP URL tidak ditemukan"
+              )
 
           build_type = str(
               data.get("buildType")
               or data.get("build_type")
               or "release"
-          ).lower()
+          ).lower().strip()
 
-          if build_type not in ("release", "debug", "profile"):
+          if build_type not in (
+              "release",
+              "debug",
+              "profile"
+          ):
               build_type = "release"
 
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"SOURCE_URL={url}\n")
               f.write(f"BUILD_TYPE={build_type}\n")
 
-          print("Payload OK")
+          print("Payload: OK")
           print("Build type:", build_type)
           PY
 
-      - name: "03 • Download source"
+      - name: "03 • Download source ZIP"
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -105,53 +113,32 @@ jobs:
 
           rm -rf source.zip source project
 
-          if [ -z "${SOURCE_URL:-}" ]; then
-            echo "ERROR: SOURCE_URL kosong"
-            exit 1
-          fi
+          test -n "${SOURCE_URL:-}"
 
-          HOST="$(
-            python3 - <<'PY'
-          import os
-          from urllib.parse import urlparse
-          print(urlparse(os.environ["SOURCE_URL"]).netloc.lower())
-          PY
-          )"
+          echo "Downloading source..."
 
-          echo "Source host: $HOST"
+          curl \
+            --fail \
+            --show-error \
+            --location \
+            --retry 5 \
+            --retry-delay 2 \
+            --connect-timeout 30 \
+            --max-time 900 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "$SOURCE_URL" \
+            -o source.zip
 
-          if [[ "$HOST" == "github.com" || "$HOST" == "api.github.com" ]]; then
-            curl \
-              --fail \
-              --show-error \
-              --location \
-              --retry 5 \
-              --retry-delay 2 \
-              --connect-timeout 30 \
-              --max-time 600 \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/octet-stream" \
-              "$SOURCE_URL" \
-              -o source.zip
-          else
-            curl \
-              --fail \
-              --show-error \
-              --location \
-              --retry 5 \
-              --retry-delay 2 \
-              --connect-timeout 30 \
-              --max-time 600 \
-              "$SOURCE_URL" \
-              -o source.zip
-          fi
+          test -f source.zip
 
           SIZE="$(stat -c%s source.zip)"
 
-          echo "ZIP size: $SIZE bytes"
+          echo "ZIP size: ${SIZE} bytes"
 
           if [ "$SIZE" -lt 1024 ]; then
-            echo "ERROR: ZIP terlalu kecil"
+            echo "ERROR: source ZIP terlalu kecil"
+            file source.zip || true
             exit 1
           fi
 
@@ -165,7 +152,9 @@ jobs:
           from pathlib import PurePosixPath
 
           if not zipfile.is_zipfile("source.zip"):
-              raise SystemExit("ERROR: source bukan ZIP valid")
+              raise SystemExit(
+                  "ERROR: source.zip bukan ZIP valid"
+              )
 
           with zipfile.ZipFile("source.zip") as z:
 
@@ -179,34 +168,35 @@ jobs:
               for item in z.infolist():
 
                   name = item.filename.replace("\\", "/")
-                  path = PurePosixPath(name)
+                  p = PurePosixPath(name)
 
                   if name.startswith("/"):
                       raise SystemExit(
-                          f"ERROR: absolute ZIP path: {name}"
+                          f"ERROR: absolute path: {name}"
                       )
 
-                  if ".." in path.parts:
+                  if ".." in p.parts:
                       raise SystemExit(
-                          f"ERROR: ZIP path traversal: {name}"
+                          f"ERROR: path traversal: {name}"
                       )
 
-          print("ZIP validation OK")
+          print("ZIP validation: OK")
           PY
 
-      - name: "05 • Extract"
+      - name: "05 • Extract source"
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf source
-          mkdir source
+          mkdir -p source
 
           unzip -q source.zip -d source
 
           test -d source
 
-      - name: "06 • Find Flutter project"
+          echo "Source extracted."
+
+      - name: "06 • Locate Flutter project"
         shell: bash
         run: |
           set -euo pipefail
@@ -232,14 +222,11 @@ jobs:
           )
 
           if [ -z "$PROJECT_ROOT" ]; then
-
             echo "ERROR: Flutter project tidak ditemukan."
-
             find source \
               -type f \
               -name pubspec.yaml \
               -print || true
-
             exit 1
           fi
 
@@ -248,32 +235,133 @@ jobs:
           echo "Project:"
           echo "$PROJECT_ROOT"
 
-      - name: "07 • Prepare project"
+      - name: "07 • Detect Flutter SDK version"
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf project
-          mkdir project
+          cd "$PROJECT_ROOT"
 
-          cp -a "$PROJECT_ROOT"/. project/
+          FLUTTER_VERSION=""
 
-          test -f project/pubspec.yaml
-          test -d project/lib
-          test -d project/android
+          # Prioritas 1:
+          # .metadata menyimpan versi Flutter yang
+          # digunakan saat project dibuat.
+          if [ -f ".metadata" ]; then
 
-          echo "Project prepared."
+            FLUTTER_VERSION="$(
+              python3 - <<'PY'
+          import re
+          from pathlib import Path
 
-      - name: "08 • Detect Android toolchain"
+          text = Path(".metadata").read_text(
+              encoding="utf-8",
+              errors="ignore"
+          )
+
+          patterns = [
+              r"version:\s*([0-9]+\.[0-9]+\.[0-9]+)",
+              r"version:\s*([0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9.+-]+)"
+          ]
+
+          for pattern in patterns:
+              m = re.search(pattern, text)
+
+              if m:
+                  print(m.group(1))
+                  break
+          PY
+            )"
+
+          fi
+
+          # Prioritas 2:
+          # environment.flutter pada pubspec.
+          if [ -z "$FLUTTER_VERSION" ] &&
+             [ -f pubspec.yaml ]; then
+
+            FLUTTER_VERSION="$(
+              python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path("pubspec.yaml").read_text(
+              encoding="utf-8",
+              errors="ignore"
+          )
+
+          m = re.search(
+              r'(?m)^\s*sdk:\s*[><=~^]*\s*([0-9]+\.[0-9]+)',
+              text
+          )
+
+          if m:
+              print(m.group(1))
+          PY
+            )"
+          fi
+
+          # Jika hanya major.minor yang ditemukan,
+          # jangan menebak patch version.
+          if [[ "$FLUTTER_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            FLUTTER_VERSION=""
+          fi
+
+          if [ -n "$FLUTTER_VERSION" ]; then
+            echo "FLUTTER_VERSION=$FLUTTER_VERSION" >> "$GITHUB_ENV"
+
+            echo "=========================================="
+            echo " BASE FLUTTER VERSION DETECTED"
+            echo "=========================================="
+            echo "$FLUTTER_VERSION"
+            echo "=========================================="
+          else
+            echo "FLUTTER_VERSION=" >> "$GITHUB_ENV"
+
+            echo "No exact Flutter version found."
+            echo "Worker will use compatibility fallback."
+          fi
+
+      - name: "08 • Setup Flutter matching base"
+        if: env.FLUTTER_VERSION != ''
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: "09 • Setup Flutter fallback"
+        if: env.FLUTTER_VERSION == ''
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: "10 • Verify Flutter"
         shell: bash
         run: |
           set -euo pipefail
 
-          cd project
+          echo "=========================================="
+          echo " FLUTTER SDK"
+          echo "=========================================="
 
-          echo "=========================================="
-          echo " DETECTING ORIGINAL ANDROID TOOLCHAIN"
-          echo "=========================================="
+          flutter --version
+          dart --version
+
+          echo
+          echo "Flutter SDK:"
+          which flutter
+
+          echo
+          echo "Expected base version:"
+          echo "${FLUTTER_VERSION:-not detected}"
+
+      - name: "11 • Detect Gradle / AGP / Kotlin"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
 
           WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
 
@@ -289,7 +377,8 @@ jobs:
 
           text = open(
               sys.argv[1],
-              encoding="utf-8"
+              encoding="utf-8",
+              errors="ignore"
           ).read()
 
           m = re.search(
@@ -310,21 +399,21 @@ jobs:
               Path("android/settings.gradle"),
               Path("android/settings.gradle.kts"),
               Path("android/build.gradle"),
-              Path("android/build.gradle.kts"),
+              Path("android/build.gradle.kts")
           ]
 
           patterns = [
-              r'com\.android\.application["\']?\s*(?:version\s*)?["\']([0-9.]+)["\']',
+              r'com\.android\.application["\']?\s*version\s*["\']([0-9.]+)["\']',
               r'com\.android\.tools\.build:gradle:([0-9.]+)',
-              r'com\.android\.application.*?version\s*[= ]\s*["\']([0-9.]+)["\']',
+              r'id\s*\(\s*["\']com\.android\.application["\']\s*\)\s*version\s*["\']([0-9.]+)["\']'
           ]
 
-          for path in files:
+          for p in files:
 
-              if not path.exists():
+              if not p.exists():
                   continue
 
-              text = path.read_text(
+              text = p.read_text(
                   encoding="utf-8",
                   errors="ignore"
               )
@@ -354,21 +443,21 @@ jobs:
               Path("android/settings.gradle"),
               Path("android/settings.gradle.kts"),
               Path("android/build.gradle"),
-              Path("android/build.gradle.kts"),
+              Path("android/build.gradle.kts")
           ]
 
           patterns = [
-              r'kotlin.*?version\s*[= ]\s*["\']([0-9.]+)["\']',
+              r'kotlin.*?version\s*[=:]\s*["\']([0-9.]+)["\']',
               r'kotlin_version\s*=\s*["\']([0-9.]+)["\']',
-              r'kotlin-gradle-plugin:([0-9.]+)',
+              r'kotlin-gradle-plugin:([0-9.]+)'
           ]
 
-          for path in files:
+          for p in files:
 
-              if not path.exists():
+              if not p.exists():
                   continue
 
-              text = path.read_text(
+              text = p.read_text(
                   encoding="utf-8",
                   errors="ignore"
               )
@@ -394,176 +483,133 @@ jobs:
           echo "KOTLIN_VERSION=$KOTLIN_VERSION" >> "$GITHUB_ENV"
 
           echo
-          echo "Original Gradle : ${GRADLE_VERSION:-unknown}"
-          echo "Original AGP    : ${AGP_VERSION:-unknown}"
-          echo "Original Kotlin : ${KOTLIN_VERSION:-unknown}"
+          echo "Gradle : ${GRADLE_VERSION:-unknown}"
+          echo "AGP    : ${AGP_VERSION:-unknown}"
+          echo "Kotlin : ${KOTLIN_VERSION:-unknown}"
 
-      - name: "09 • Select compatible Java"
+      - name: "12 • Select Java for Gradle"
         shell: bash
         run: |
           set -euo pipefail
 
-          VERSION="${GRADLE_VERSION:-}"
+          VERSION="${GRADLE_VERSION:-0}"
 
-          MAJOR="$(
-            echo "$VERSION" |
-              cut -d. -f1
-          )"
-
-          MINOR="$(
-            echo "$VERSION" |
-              cut -d. -f2
-          )"
+          MAJOR="$(echo "$VERSION" | cut -d. -f1)"
+          MINOR="$(echo "$VERSION" | cut -d. -f2)"
 
           MAJOR="${MAJOR:-0}"
           MINOR="${MINOR:-0}"
 
-          echo "Gradle major: $MAJOR"
-          echo "Gradle minor: $MINOR"
-
-          # Gradle < 7.3 cannot reliably run on Java 17.
-          # Old Flutter projects therefore get Java 11.
+          # Gradle < 7.3 -> Java 11
           if [ "$MAJOR" -lt 7 ] ||
              { [ "$MAJOR" -eq 7 ] && [ "$MINOR" -lt 3 ]; }; then
 
-            echo "JAVA_BUILD_VERSION=11" >> "$GITHUB_ENV"
+            JAVA_VERSION="11"
 
-            echo "Selected Java 11"
-            echo "Reason: old Gradle"
-
+          # Gradle 7.3 through 8.x -> Java 17
           else
 
-            echo "JAVA_BUILD_VERSION=17" >> "$GITHUB_ENV"
-
-            echo "Selected Java 17"
-            echo "Reason: modern Gradle"
+            JAVA_VERSION="17"
 
           fi
 
-      - name: "10 • Setup selected Java"
+          echo "JAVA_VERSION=$JAVA_VERSION" >> "$GITHUB_ENV"
+
+          echo "Selected Java: $JAVA_VERSION"
+
+      - name: "13 • Setup Java"
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_BUILD_VERSION }}
+          java-version: ${{ env.JAVA_VERSION }}
 
-      - name: "11 • Verify Java"
+      - name: "14 • Verify Java"
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "JAVA_BUILD_VERSION=$JAVA_BUILD_VERSION"
           echo "JAVA_HOME=$JAVA_HOME"
 
           java -version
           javac -version
 
-      - name: "12 • Setup Flutter"
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: "13 • Flutter compatibility analysis"
+      - name: "15 • Preserve original Android project"
         shell: bash
         run: |
           set -euo pipefail
 
-          cd project
+          cd "$PROJECT_ROOT"
 
-          flutter --version
-          dart --version
+          rm -rf android.worker-original
 
-          echo
-          echo "Running Flutter compatibility analysis..."
+          cp -a android android.worker-original
 
-          flutter analyze --suggestions \
-            2>&1 | tee flutter_suggestions.log || true
+          echo "Original Android project backed up."
 
-          echo
-          echo "Original Gradle : ${GRADLE_VERSION:-unknown}"
-          echo "Original AGP    : ${AGP_VERSION:-unknown}"
-          echo "Original Kotlin : ${KOTLIN_VERSION:-unknown}"
-
-      - name: "14 • Preserve old project"
+      - name: "16 • Prepare Gradle"
         shell: bash
         run: |
           set -euo pipefail
 
-          cd project
-
-          cp -a android android.worker-backup
-
-          if [ -f pubspec.yaml ]; then
-            cp pubspec.yaml pubspec.worker-backup.yaml
-          fi
-
-      - name: "15 • Prepare Gradle without forced upgrade"
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd project
+          cd "$PROJECT_ROOT"
 
           chmod +x android/gradlew
 
           echo "=========================================="
-          echo " ORIGINAL GRADLE PRESERVED"
+          echo " ORIGINAL GRADLE"
           echo "=========================================="
 
           ./android/gradlew --version
 
-      - name: "16 • Android manifest check"
+      - name: "17 • Flutter compatibility check"
         shell: bash
         run: |
           set -euo pipefail
 
-          cd project
+          cd "$PROJECT_ROOT"
 
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          flutter doctor -v
 
-          test -f "$MANIFEST"
+          echo
+          echo "Flutter suggestions:"
 
-          python3 - "$MANIFEST" <<'PY'
-          import sys
-          import xml.etree.ElementTree as ET
+          flutter analyze --suggestions \
+            2>&1 | tee flutter_suggestions.log || true
 
-          try:
-              tree = ET.parse(sys.argv[1])
-          except Exception as e:
-              raise SystemExit(
-                  f"ERROR: AndroidManifest invalid: {e}"
-              )
-
-          if tree.getroot().tag != "manifest":
-              raise SystemExit(
-                  "ERROR: invalid manifest root"
-              )
-
-          print("Manifest OK")
-          PY
-
-      - name: "17 • Flutter dependencies"
+      - name: "18 • Flutter pub get"
         shell: bash
         run: |
           set -euo pipefail
 
-          cd project
+          cd "$PROJECT_ROOT"
 
           flutter pub get
 
-      - name: "18 • Build APK"
-        id: original_build
+      - name: "19 • Build original project"
+        id: build_original
         shell: bash
         run: |
           set -o pipefail
 
-          cd project
+          cd "$PROJECT_ROOT"
 
           rm -f flutter_build.log
 
           echo "=========================================="
-          echo " BUILDING ORIGINAL PROJECT"
+          echo " BUILDING BASE WITH ITS OWN TOOLCHAIN"
           echo "=========================================="
+
+          echo "Flutter :"
+          flutter --version
+
+          echo
+          echo "Gradle:"
+          ./android/gradlew --version
+
+          echo
+          echo "AGP    : ${AGP_VERSION:-unknown}"
+          echo "Kotlin : ${KOTLIN_VERSION:-unknown}"
+          echo "Java   : ${JAVA_VERSION}"
 
           case "$BUILD_TYPE" in
 
@@ -590,86 +636,46 @@ jobs:
 
           esac
 
-      - name: "19 • Compatibility repair"
+      - name: "20 • Controlled compatibility repair"
         if: failure()
         shell: bash
         run: |
           set -euo pipefail
 
-          cd project
+          cd "$PROJECT_ROOT"
 
           echo "=========================================="
           echo " ORIGINAL BUILD FAILED"
-          echo " STARTING SAFE COMPATIBILITY REPAIR"
+          echo " CONTROLLED REPAIR"
           echo "=========================================="
 
-          cp -a android.worker-backup/. android/
+          echo
+          echo "IMPORTANT:"
+          echo "Tidak mengganti AGP ke 9."
+          echo "Tidak mengganti Gradle secara membabi-buta."
+          echo "Tidak mengganti Flutter SDK."
 
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
-
-          files = [
-              Path("android/settings.gradle"),
-              Path("android/settings.gradle.kts"),
-              Path("android/build.gradle"),
-              Path("android/build.gradle.kts"),
-          ]
-
-          print("Scanning Android Gradle files...")
-
-          for path in files:
-
-              if not path.exists():
-                  continue
-
-              text = path.read_text(
-                  encoding="utf-8",
-                  errors="ignore"
-              )
-
-              # Kotlin versions below Flutter's minimum
-              # are raised conservatively.
-              text = re.sub(
-                  r'(kotlin_version\s*=\s*[\'"])[0-9.]+([\'"])',
-                  r'\g<1>1.9.24\2',
-                  text
-              )
-
-              text = re.sub(
-                  r'(kotlin[^\n]*version\s*[=:]\s*[\'"])[0-9.]+([\'"])',
-                  r'\g<1>1.9.24\2',
-                  text,
-                  flags=re.I
-              )
-
-              path.write_text(
-                  text,
-                  encoding="utf-8"
-              )
-
-              print("Checked:", path)
-
-          PY
+          # Restore original Android project first.
+          rm -rf android
+          cp -a android.worker-original android
 
           chmod +x android/gradlew
 
-          echo
-          echo "Retrying dependency resolution..."
-
+          # Generate fresh Flutter Android migration
+          # only when the Flutter SDK explicitly supports
+          # the current project structure.
           flutter pub get
 
-      - name: "20 • Build after compatibility repair"
+          echo
+          echo "Retrying original project..."
+
+      - name: "21 • Retry APK"
         if: failure()
         shell: bash
         run: |
           set -o pipefail
 
-          cd project
-
-          echo "=========================================="
-          echo " BUILD RETRY"
-          echo "=========================================="
+          cd "$PROJECT_ROOT"
 
           rm -f flutter_build_retry.log
 
@@ -698,36 +704,43 @@ jobs:
 
           esac
 
-      - name: "21 • Find APK"
+      - name: "22 • Collect APK"
         if: success()
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p output
+          cd "$PROJECT_ROOT"
 
-          find project/build/app/outputs/apk \
+          rm -rf "$GITHUB_WORKSPACE/output"
+          mkdir -p "$GITHUB_WORKSPACE/output"
+
+          find build/app/outputs/apk \
             -type f \
             -name "*.apk" \
-            -exec cp {} output/ \;
+            -exec cp {} "$GITHUB_WORKSPACE/output/" \;
 
-          COUNT="$(
-            find output \
+          if ! find "$GITHUB_WORKSPACE/output" \
               -type f \
               -name "*.apk" \
-              | wc -l
-          )"
+              | grep -q .; then
 
-          if [ "$COUNT" -eq 0 ]; then
             echo "ERROR: APK tidak ditemukan"
+
+            find build \
+              -type f \
+              | head -n 100
+
             exit 1
           fi
 
-          echo
-          echo "APK:"
-          ls -lh output/*.apk
+          echo "=========================================="
+          echo " APK SUCCESS"
+          echo "=========================================="
 
-      - name: "22 • Upload APK"
+          ls -lh "$GITHUB_WORKSPACE"/output/*.apk
+
+      - name: "23 • Upload APK"
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -738,25 +751,26 @@ jobs:
           compression-level: 0
           overwrite: true
 
-      - name: "23 • Diagnostics"
+      - name: "24 • Diagnostics"
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: diagnostics-${{ inputs.jobId }}
           path: |
-            project/flutter_build.log
-            project/flutter_build_retry.log
-            project/flutter_suggestions.log
-            project/pubspec.yaml
-            project/pubspec.lock
-            project/android/gradle/wrapper/gradle-wrapper.properties
-            project/android/build.gradle
-            project/android/build.gradle.kts
-            project/android/settings.gradle
-            project/android/settings.gradle.kts
-            project/android/app/build.gradle
-            project/android/app/build.gradle.kts
-            project/android/app/src/main/AndroidManifest.xml
+            ${{ env.PROJECT_ROOT }}/flutter_build.log
+            ${{ env.PROJECT_ROOT }}/flutter_build_retry.log
+            ${{ env.PROJECT_ROOT }}/flutter_suggestions.log
+            ${{ env.PROJECT_ROOT }}/pubspec.yaml
+            ${{ env.PROJECT_ROOT }}/pubspec.lock
+            ${{ env.PROJECT_ROOT }}/.metadata
+            ${{ env.PROJECT_ROOT }}/android/gradle/wrapper/gradle-wrapper.properties
+            ${{ env.PROJECT_ROOT }}/android/build.gradle
+            ${{ env.PROJECT_ROOT }}/android/build.gradle.kts
+            ${{ env.PROJECT_ROOT }}/android/settings.gradle
+            ${{ env.PROJECT_ROOT }}/android/settings.gradle.kts
+            ${{ env.PROJECT_ROOT }}/android/app/build.gradle
+            ${{ env.PROJECT_ROOT }}/android/app/build.gradle.kts
+            ${{ env.PROJECT_ROOT }}/android/app/src/main/AndroidManifest.xml
           if-no-files-found: warn
           retention-days: 2
           compression-level: 0
