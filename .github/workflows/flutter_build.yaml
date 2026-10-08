@@ -1,0 +1,376 @@
+name: Flutter Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "SC Build Job ID"
+        required: true
+        type: string
+
+      userId:
+        description: "Telegram User ID"
+        required: true
+        type: string
+
+      payload:
+        description: "SC Build JSON payload"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: flutter-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Flutter APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      USER_ID: ${{ inputs.userId }}
+      PAYLOAD: ${{ inputs.payload }}
+      FLUTTER_CHANNEL: stable
+      JAVA_VERSION: "17"
+
+    steps:
+
+      - name: 01 - Initialize
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================"
+          echo " WEB TO APK BY ZIPERR"
+          echo " FLUTTER BUILD WORKER"
+          echo "============================================"
+          echo "Job ID : ${JOB_ID}"
+          echo "User ID: ${USER_ID}"
+          echo "Run ID : ${GITHUB_RUN_ID}"
+          echo "Workspace: ${GITHUB_WORKSPACE}"
+          echo "============================================"
+
+      - name: 02 - Parse payload
+        id: payload
+        shell: bash
+        env:
+          RAW_PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          raw = os.environ.get("RAW_PAYLOAD", "").strip()
+
+          if not raw:
+              raise SystemExit("payload kosong")
+
+          try:
+              data = json.loads(raw)
+          except Exception as e:
+              raise SystemExit(f"payload JSON tidak valid: {e}")
+
+          url = str(data.get("url", "")).strip()
+
+          tag = str(
+              data.get("tag")
+              or data.get("jobId")
+              or os.environ.get("GITHUB_RUN_ID")
+          ).strip()
+
+          build_type = str(
+              data.get("buildType")
+              or "release"
+          ).strip().lower()
+
+          if not url:
+              raise SystemExit("payload.url kosong")
+
+          if not url.startswith(("http://", "https://")):
+              raise SystemExit(
+                  "payload.url harus http:// atau https://"
+              )
+
+          if build_type not in ("release", "debug"):
+              build_type = "release"
+
+          with open(
+              os.environ["GITHUB_OUTPUT"],
+              "a",
+              encoding="utf-8"
+          ) as f:
+              f.write(f"url={url}\n")
+              f.write(f"tag={tag}\n")
+              f.write(f"build_type={build_type}\n")
+
+          print("Payload OK")
+          print("URL:", url)
+          print("Tag:", tag)
+          print("Build type:", build_type)
+          PY
+
+      - name: 03 - Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 04 - Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: 05 - Verify tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter --version
+          java -version
+
+          echo
+          echo "Workspace:"
+          pwd
+          ls -la
+
+      - name: 06 - Download source ZIP
+        shell: bash
+        env:
+          SOURCE_URL: ${{ steps.payload.outputs.url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          rm -f source.zip
+
+          echo "Downloading source:"
+          echo "${SOURCE_URL}"
+
+          curl \
+            --fail \
+            --show-error \
+            --location \
+            --retry 6 \
+            --retry-all-errors \
+            --retry-delay 3 \
+            --connect-timeout 30 \
+            --max-time 900 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            -o source.zip \
+            "${SOURCE_URL}"
+
+          if [ ! -s source.zip ]; then
+            echo "::error::source.zip kosong."
+            exit 1
+          fi
+
+          SIZE="$(stat -c%s source.zip)"
+
+          echo "Source ZIP size: ${SIZE} bytes"
+
+          if [ "${SIZE}" -lt 1000 ]; then
+            echo "::error::Source ZIP terlalu kecil."
+            file source.zip || true
+            exit 1
+          fi
+
+          file source.zip || true
+
+      - name: 07 - Extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf extracted project
+
+          mkdir -p extracted
+          mkdir -p project
+
+          echo "Extracting source.zip..."
+
+          unzip -q source.zip -d extracted
+
+          echo "Searching pubspec.yaml..."
+
+          PUBSPEC="$(
+            find extracted \
+              -type f \
+              -name "pubspec.yaml" \
+              -print \
+              | head -n 1
+          )"
+
+          if [ -z "${PUBSPEC}" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan."
+
+            find extracted \
+              -maxdepth 5 \
+              -type f \
+              | head -200
+
+            exit 1
+          fi
+
+          PROJECT_ROOT="$(dirname "${PUBSPEC}")"
+
+          echo "Project root:"
+          echo "${PROJECT_ROOT}"
+
+          cp -a "${PROJECT_ROOT}/." project/
+
+          if [ ! -f "project/pubspec.yaml" ]; then
+            echo "::error::pubspec.yaml gagal dipindahkan."
+            exit 1
+          fi
+
+          if [ ! -d "project/android" ]; then
+            echo "::error::Folder android tidak ditemukan."
+
+            find project \
+              -maxdepth 3 \
+              -type d \
+              | sort \
+              | head -150
+
+            exit 1
+          fi
+
+          echo "Flutter project berhasil disiapkan."
+
+      - name: 08 - Prepare Flutter project
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SCRIPT="${GITHUB_WORKSPACE}/scripts/build_flutter.sh"
+
+          echo "Using worker script:"
+          echo "${SCRIPT}"
+
+          if [ ! -f "${SCRIPT}" ]; then
+            echo "::error::build_flutter.sh tidak ditemukan."
+            echo
+            echo "Workspace structure:"
+
+            find "${GITHUB_WORKSPACE}" \
+              -maxdepth 4 \
+              -type f \
+              | sort \
+              | head -250
+
+            exit 1
+          fi
+
+          chmod +x "${SCRIPT}"
+
+          "${SCRIPT}" prepare
+
+      - name: 09 - Flutter dependencies
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter pub get
+
+      - name: 10 - Build APK
+        working-directory: project
+        env:
+          BUILD_TYPE: ${{ steps.payload.outputs.build_type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SCRIPT="${GITHUB_WORKSPACE}/scripts/build_flutter.sh"
+
+          echo "Using worker script:"
+          echo "${SCRIPT}"
+
+          if [ ! -f "${SCRIPT}" ]; then
+            echo "::error::build_flutter.sh tidak ditemukan."
+            exit 1
+          fi
+
+          chmod +x "${SCRIPT}"
+
+          "${SCRIPT}" build
+
+      - name: 11 - Collect APK
+        id: apk
+        shell: bash
+        env:
+          TAG: ${{ steps.payload.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo "Searching APK..."
+
+          APK="$(
+            find project/build/app/outputs \
+              -type f \
+              -name "*.apk" \
+              -print \
+              | sort \
+              | head -n 1
+          )"
+
+          if [ -z "${APK}" ]; then
+            echo "::error::APK tidak ditemukan."
+
+            find project/build/app/outputs \
+              -maxdepth 8 \
+              -type f \
+              2>/dev/null || true
+
+            exit 1
+          fi
+
+          echo "APK found:"
+          echo "${APK}"
+
+          mkdir -p output
+
+          SAFE_TAG="$(
+            echo "${TAG}" |
+            tr -c 'A-Za-z0-9._-' '_'
+          )"
+
+          DEST="output/flutter-${SAFE_TAG}.apk"
+
+          cp "${APK}" "${DEST}"
+
+          echo "path=${DEST}" >> "${GITHUB_OUTPUT}"
+          echo "name=flutter-${SAFE_TAG}" >> "${GITHUB_OUTPUT}"
+
+          ls -lh "${DEST}"
+
+      - name: 12 - Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: 13 - Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ inputs.jobId }}
+          path: |
+            project/flutter_build.log
+            project/build
+          if-no-files-found: warn
+          retention-days: 2
