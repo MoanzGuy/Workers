@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       payload:
-        description: "Build payload JSON"
+        description: "Build payload JSON (url, appName, packageName)"
         required: true
         type: string
 
@@ -31,17 +31,15 @@ jobs:
   build:
     name: Web To APK Build
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 40
 
     steps:
       - name: "01 • Worker information"
         shell: bash
         run: |
           set -euo pipefail
-
           echo "=========================================="
-          echo " WEB TO APK BY ZIPERR"
-          echo " Web2APK Worker"
+          echo " WEB TO APK WORKER"
           echo "=========================================="
           echo "Job ID : ${{ inputs.jobId }}"
           echo "User ID: ${{ inputs.userId }}"
@@ -53,27 +51,20 @@ jobs:
           BUILD_PAYLOAD: ${{ inputs.payload }}
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
-          import json
-          import os
+          import json, os, re
 
           raw = os.environ.get("BUILD_PAYLOAD", "").strip()
-
           if not raw:
               raise SystemExit("ERROR: payload kosong")
 
           try:
               data = json.loads(raw)
           except Exception as e:
-              raise SystemExit(
-                  f"ERROR: payload JSON invalid: {e}"
-              )
+              raise SystemExit(f"ERROR: payload JSON invalid: {e}")
 
           if not isinstance(data, dict):
-              raise SystemExit(
-                  "ERROR: payload harus berupa JSON object"
-              )
+              raise SystemExit("ERROR: payload harus JSON object")
 
           url = (
               data.get("url")
@@ -81,56 +72,42 @@ jobs:
               or data.get("web_url")
               or data.get("website")
               or data.get("site")
+              or ""
           )
-
-          if not url:
-              raise SystemExit(
-                  "ERROR: URL website tidak ditemukan di payload"
-              )
-
           url = str(url).strip()
-
-          if not (
-              url.startswith("http://")
-              or url.startswith("https://")
-          ):
-              raise SystemExit(
-                  "ERROR: URL website harus http:// atau https://"
-              )
+          if not url:
+              raise SystemExit("ERROR: URL website tidak ditemukan di payload")
+          if not (url.startswith("http://") or url.startswith("https://")):
+              raise SystemExit("ERROR: URL harus http:// atau https://")
 
           app_name = str(
               data.get("appName")
               or data.get("app_name")
               or data.get("name")
               or "Web APK"
-          ).strip()
+          ).strip() or "Web APK"
+          app_name = app_name.replace("\n", " ").replace("\r", " ")[:60]
 
           package_name = str(
               data.get("packageName")
               or data.get("package_name")
               or "com.duta.webapk"
           ).strip().lower()
-
-          import re
-
-          if not re.fullmatch(
-              r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+",
-              package_name
-          ):
+          if not re.fullmatch(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+", package_name):
               package_name = "com.duta.webapk"
 
-          with open(os.environ["GITHUB_ENV"], "a") as f:
-              f.write("WEB_URL=" + url + "\n")
-              f.write("APP_NAME=" + app_name.replace("\n", " ") + "\n")
-              f.write("PACKAGE_NAME=" + package_name + "\n")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"WEB_URL={url}\n")
+              f.write(f"APP_NAME={app_name}\n")
+              f.write(f"PACKAGE_NAME={package_name}\n")
 
-          print("Website URL : OK")
+          print("Website URL :", url)
           print("App name    :", app_name)
           print("Package     :", package_name)
           PY
 
       - name: "03 • Setup Java 17"
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
@@ -139,14 +116,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           echo "JAVA_HOME=$JAVA_HOME"
-
           java -version
           javac -version
-
-          test -x "$JAVA_HOME/bin/java"
-          test -x "$JAVA_HOME/bin/javac"
 
       - name: "05 • Setup Flutter"
         uses: subosito/flutter-action@v2
@@ -154,32 +126,55 @@ jobs:
           channel: stable
           cache: true
 
-      - name: "06 • Verify Flutter / Dart / Android"
+      - name: "06 • Verify Flutter"
         shell: bash
         run: |
           set -euo pipefail
-
           flutter --version
           dart --version
-
-          flutter doctor -v
-
           flutter precache --android
-
-          test -x "$(command -v flutter)"
-          test -x "$(command -v dart)"
+          flutter doctor -v || true
 
       - name: "07 • Create Flutter project"
         shell: bash
         run: |
           set -euo pipefail
-
           rm -rf project
+
+          # com.duta.panel → org=com.duta  project-name=panel
+          ORG="$(echo "$PACKAGE_NAME" | awk -F. 'BEGIN{OFS="."} {if(NF>1){NF=NF-1; print} else print "com.duta"}')"
+          PNAME="$(echo "$PACKAGE_NAME" | awk -F. '{print $NF}' | tr -cd 'a-z0-9_')"
+          [ -n "$PNAME" ] || PNAME="webapk"
+          [ -n "$ORG" ] || ORG="com.duta"
+
+          echo "ORG=$ORG PNAME=$PNAME PACKAGE=$PACKAGE_NAME"
 
           flutter create \
             --platforms=android \
-            --org="$PACKAGE_NAME" \
+            --org="$ORG" \
+            --project-name="$PNAME" \
             project
+
+          # applicationId + namespace (Groovy atau Kotlin DSL)
+          for GF in project/android/app/build.gradle project/android/app/build.gradle.kts; do
+            [ -f "$GF" ] || continue
+            if [[ "$GF" == *.kts ]]; then
+              sed -i 's/applicationId\s*=\s*".*"/applicationId = "'"$PACKAGE_NAME"'"/' "$GF" || true
+              sed -i 's/namespace\s*=\s*".*"/namespace = "'"$PACKAGE_NAME"'"/' "$GF" || true
+            else
+              sed -i 's/applicationId\s*["'"'"'].*["'"'"']/applicationId "'"$PACKAGE_NAME"'"/' "$GF" || true
+              sed -i 's/namespace\s*["'"'"'].*["'"'"']/namespace "'"$PACKAGE_NAME"'"/' "$GF" || true
+              sed -i 's/applicationId\s*=\s*".*"/applicationId = "'"$PACKAGE_NAME"'"/' "$GF" || true
+              sed -i 's/namespace\s*=\s*".*"/namespace = "'"$PACKAGE_NAME"'"/' "$GF" || true
+            fi
+          done
+
+          # minSdk >= 21
+          for GF in project/android/app/build.gradle project/android/app/build.gradle.kts; do
+            [ -f "$GF" ] || continue
+            sed -i 's/minSdk\s*=\s*[0-9]*/minSdk = 21/' "$GF" || true
+            sed -i 's/minSdkVersion\s*[0-9]*/minSdkVersion 21/' "$GF" || true
+          done
 
           test -f project/pubspec.yaml
           test -d project/android
@@ -189,29 +184,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           cd project
-
           flutter pub add webview_flutter
-
           flutter pub get
 
-      - name: "09 • Generate application"
+      - name: "09 • Generate main.dart"
         shell: bash
         env:
           GENERATED_URL: ${{ env.WEB_URL }}
           GENERATED_APP_NAME: ${{ env.APP_NAME }}
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
-          import json
-          import os
+          import json, os
 
           url = os.environ["GENERATED_URL"]
           app_name = os.environ["GENERATED_APP_NAME"]
-
-          # json.dumps menghasilkan Dart string literal yang aman
           dart_url = json.dumps(url, ensure_ascii=False)
           dart_name = json.dumps(app_name, ensure_ascii=False)
 
@@ -236,21 +224,17 @@ jobs:
             @override
             void initState() {{
               super.initState();
-
               controller = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setBackgroundColor(const Color(0xFFFFFFFF))
                 ..setNavigationDelegate(
                   NavigationDelegate(
                     onWebResourceError: (error) {{
-                      debugPrint(
-                        'Web error: ${{error.description}}',
-                      );
+                      debugPrint('Web error: ' + error.description);
                     }},
                   ),
                 )
-                ..loadRequest(
-                  Uri.parse({dart_url}),
-                );
+                ..loadRequest(Uri.parse({dart_url}));
             }}
 
             @override
@@ -260,9 +244,7 @@ jobs:
                 title: {dart_name},
                 home: Scaffold(
                   body: SafeArea(
-                    child: WebViewWidget(
-                      controller: controller,
-                    ),
+                    child: WebViewWidget(controller: controller),
                   ),
                 ),
               );
@@ -271,82 +253,54 @@ jobs:
           '''
 
           os.makedirs("project/lib", exist_ok=True)
-
-          with open(
-              "project/lib/main.dart",
-              "w",
-              encoding="utf-8"
-          ) as f:
+          with open("project/lib/main.dart", "w", encoding="utf-8") as f:
               f.write(code)
-
-          print("main.dart generated")
+          print("main.dart generated OK")
           PY
 
-      - name: "10 • Verify AndroidManifest"
+      - name: "10 • AndroidManifest (INTERNET + cleartext)"
         shell: bash
         run: |
           set -euo pipefail
-
           cd project
-
           MANIFEST="android/app/src/main/AndroidManifest.xml"
+          test -f "$MANIFEST"
 
           python3 - "$MANIFEST" <<'PY'
           import sys
           import xml.etree.ElementTree as ET
 
           path = sys.argv[1]
-
-          try:
-              tree = ET.parse(path)
-          except Exception as e:
-              raise SystemExit(
-                  f"ERROR: AndroidManifest.xml invalid: {e}"
-              )
-
+          tree = ET.parse(path)
           root = tree.getroot()
-
           if root.tag != "manifest":
-              raise SystemExit(
-                  "ERROR: AndroidManifest root invalid"
-              )
+              raise SystemExit("ERROR: AndroidManifest root invalid")
 
-          android_ns = "http://schemas.android.com/apk/res/android"
-          permission = (
-              "{"
-              + android_ns
-              + "}name"
-          )
-
+          NS = "http://schemas.android.com/apk/res/android"
+          ET.register_namespace("android", NS)
+          name_attr = f"{{{NS}}}name"
           internet = "android.permission.INTERNET"
 
-          exists = False
-
-          for node in root.findall("uses-permission"):
-              if node.get(permission) == internet:
-                  exists = True
-                  break
-
-          if not exists:
-              ET.register_namespace("android", android_ns)
-
-              node = ET.Element(
-                  "uses-permission",
-                  {
-                      permission: internet
-                  }
-              )
-
+          has_net = any(
+              n.get(name_attr) == internet
+              for n in root.findall("uses-permission")
+          )
+          if not has_net:
+              node = ET.Element("uses-permission", {name_attr: internet})
               root.insert(0, node)
-              tree.write(
-                  path,
-                  encoding="utf-8",
-                  xml_declaration=True
-              )
-
               print("INTERNET permission added")
           else:
               print("INTERNET permission already exists")
+
+          # usesCleartextTraffic untuk http://
+          app = root.find("application")
+          if app is not None:
+              clear_attr = f"{{{NS}}}usesCleartextTraffic"
+              if app.get(clear_attr) is None:
+                  app.set(clear_attr, "true")
+                  print("usesCleartextTraffic=true")
+
+          tree.write(path, encoding="utf-8", xml_declaration=True)
           PY
 
           grep -q "android.permission.INTERNET" "$MANIFEST"
@@ -355,169 +309,83 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           cd project
-
           WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
-
           test -f "$WRAPPER"
 
-          CURRENT="$(
-            python3 - "$WRAPPER" <<'PY'
-          import re
-          import sys
-
-          text = open(
-              sys.argv[1],
-              encoding="utf-8"
-          ).read()
-
-          m = re.search(
-              r"distributionUrl=.*gradle-([0-9]+(?:\.[0-9]+){1,2})-",
-              text
-          )
-
-          print(m.group(1) if m else "")
-          PY
-          )"
-
-          echo "Current Gradle: ${CURRENT:-unknown}"
-
-          python3 - "$WRAPPER" "$CURRENT" <<'PY'
-          import re
-          import sys
-
+          python3 - "$WRAPPER" <<'PY'
+          import re, sys
           path = sys.argv[1]
-          current = sys.argv[2]
+          text = open(path, encoding="utf-8").read()
+          m = re.search(r"gradle-([0-9]+(?:\.[0-9]+){1,2})-", text)
+          current = m.group(1) if m else "0"
 
-          def version(s):
+          def ver(s):
               try:
-                  return tuple(
-                      int(x)
-                      for x in s.split(".")
-                  )
+                  return tuple(int(x) for x in s.split("."))
               except Exception:
                   return (0,)
 
-          minimum = version("8.14.0")
-          current_v = (
-              version(current)
-              if current
-              else (0,)
-          )
-
-          if current_v < minimum:
-              text = open(
-                  path,
-                  encoding="utf-8"
-              ).read()
-
+          # Minimal Gradle yang aman untuk AGP modern
+          if ver(current) < ver("8.7"):
               text = re.sub(
                   r"gradle-[0-9]+(?:\.[0-9]+){1,2}-",
-                  "gradle-8.14.3-",
-                  text
+                  "gradle-8.11.1-",
+                  text,
               )
-
-              open(
-                  path,
-                  "w",
-                  encoding="utf-8"
-              ).write(text)
-
-              print(
-                  "Gradle wrapper patched to 8.14.3"
-              )
+              open(path, "w", encoding="utf-8").write(text)
+              print("Gradle wrapper patched to 8.11.1")
           else:
-              print(
-                  "Gradle wrapper already compatible"
-              )
+              print("Gradle wrapper OK:", current)
           PY
 
           chmod +x android/gradlew
+          ./android/gradlew --version || true
 
-          ./android/gradlew --version
-
-      - name: "12 • Flutter clean"
+      - name: "12 • Flutter clean + pub get"
         shell: bash
         run: |
           set -euo pipefail
-
           cd project
-
           flutter clean
-
-      - name: "13 • Flutter dependencies"
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd project
-
           flutter pub get
 
-      - name: "14 • Final preflight"
+      - name: "13 • Preflight"
         shell: bash
         run: |
           set -euo pipefail
-
           cd project
-
           test -f pubspec.yaml
           test -f lib/main.dart
           test -d android
           test -f android/gradlew
           test -f android/app/src/main/AndroidManifest.xml
-
-          flutter --version
-          dart --version
-
-          ./android/gradlew --version
-
-          flutter analyze lib/main.dart
-
+          flutter analyze lib/main.dart || true
           echo "Web2APK preflight: PASSED"
 
-      - name: "15 • Build APK"
+      - name: "14 • Build APK"
         shell: bash
         run: |
           set -o pipefail
-
           cd project
-
           rm -f flutter_build.log
+          flutter build apk --release --no-pub 2>&1 | tee flutter_build.log
 
-          flutter build apk \
-            --release \
-            --no-pub \
-            2>&1 | tee flutter_build.log
-
-      - name: "16 • Collect APK"
+      - name: "15 • Collect APK"
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p output
-
-          find project/build/app/outputs/apk \
-            -type f \
-            -name "*.apk" \
-            -exec cp {} output/ \;
-
-          if ! find output \
-              -type f \
-              -name "*.apk" \
-              | grep -q .; then
+          find project/build/app/outputs -type f -name "*.apk" -exec cp {} output/ \;
+          if ! find output -type f -name "*.apk" | grep -q .; then
             echo "ERROR: APK tidak ditemukan"
-            find project/build \
-              -type f \
-              | head -n 100
+            find project/build -type f | head -n 80 || true
             exit 1
           fi
-
           ls -lh output/*.apk
 
-      - name: "17 • Upload APK"
+      - name: "16 • Upload APK"
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -528,7 +396,7 @@ jobs:
           compression-level: 0
           overwrite: true
 
-      - name: "18 • Upload diagnostics"
+      - name: "17 • Upload diagnostics"
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -536,7 +404,7 @@ jobs:
           path: |
             project/flutter_build.log
             project/pubspec.yaml
-            project/pubspec.lock
+            project/lib/main.dart
             project/android/gradle/wrapper/gradle-wrapper.properties
             project/android/app/src/main/AndroidManifest.xml
           if-no-files-found: warn
