@@ -1,0 +1,255 @@
+name: DUTA Web2APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: Build job ID
+        required: true
+        type: string
+      userId:
+        description: Telegram user ID
+        required: true
+        type: string
+      payload:
+        description: JSON payload from DUTA bot
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: duta-web2apk-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      USER_ID: ${{ inputs.userId }}
+      PAYLOAD: ${{ inputs.payload }}
+      ANDROID_HOME: /opt/android-sdk
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g
+
+    steps:
+      - name: 01 • Checkout
+        uses: actions/checkout@v4
+
+      - name: 02 • Parse payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          raw = os.environ.get("PAYLOAD", "")
+          try:
+              p = json.loads(raw)
+          except Exception as exc:
+              print(f"Invalid payload JSON: {exc}")
+              sys.exit(1)
+          url = str(p.get("url", "")).strip()
+          name = str(p.get("appName", "Duta Web App")).strip()
+          icon = str(p.get("iconUrl", "")).strip()
+          if not (url.startswith("http://") or url.startswith("https://")):
+              print("Payload URL must start with http:// or https://")
+              sys.exit(1)
+          if not name:
+              name = "Duta Web App"
+          # Keep values safe for GITHUB_ENV; JSON is never interpolated into a shell command.
+          def envsafe(v):
+              return v.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"WEB_URL={envsafe(url)}\n")
+              f.write(f"APP_NAME={envsafe(name[:60])}\n")
+              f.write(f"ICON_URL={envsafe(icon)}\n")
+          PY
+
+      - name: 03 • Prepare Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 03b • Install Android platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: 04 • Download icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/res/drawable app/src/main/res/mipmap-hdpi
+          if [[ -n "${ICON_URL:-}" ]]; then
+            curl --fail --location --retry 3 --connect-timeout 15 --max-time 90 \
+              -A 'DUTA-BOT-APPS/1.0' "$ICON_URL" -o app_icon.png
+            file app_icon.png || true
+          fi
+
+      - name: 05 • Generate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf app src build.gradle settings.gradle gradle.properties gradle
+          mkdir -p app/src/main/java/com/duta/web2apk app/src/main/res/drawable app/src/main/res/mipmap-hdpi
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'DutaWebAPK'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.9.1' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'com.duta.web2apk'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.duta.web2apk'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      shrinkResources false
+                  }
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.7.0'
+              implementation 'androidx.webkit:webkit:1.13.0'
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET" />
+            <application android:theme="@style/AppTheme" android:label="${APP_NAME}" android:usesCleartextTraffic="true" android:allowBackup="false" android:supportsRtl="true">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+            <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+              <item name="android:fontFamily">sans</item>
+              <item name="android:colorAccent">#2196F3</item>
+              <item name="android:windowActionModeOverlay">true</item>
+            </style>
+          </resources>
+          EOF
+
+          python3 - <<'PY'
+          import os, html
+          url=html.escape(os.environ['WEB_URL'], quote=True)
+          name=html.escape(os.environ['APP_NAME'], quote=True)
+          p='app/src/main/AndroidManifest.xml'
+          s=open(p,encoding='utf-8').read().replace('${APP_NAME}',name)
+          open(p,'w',encoding='utf-8').write(s)
+          PY
+
+          cat > app/src/main/java/com/duta/web2apk/MainActivity.java <<'EOF'
+          package com.duta.web2apk;
+
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+              @SuppressLint("SetJavaScriptEnabled")
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  webView = new WebView(this);
+                  setContentView(webView);
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setBuiltInZoomControls(false);
+                  s.setDisplayZoomControls(false);
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient());
+                  webView.loadUrl(getString(com.duta.web2apk.R.string.web_url));
+              }
+              @Override public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) webView.goBack(); else super.onBackPressed();
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<EOF
+          <resources>
+            <string name="app_name">$(python3 -c 'import os,html; print(html.escape(os.environ["APP_NAME"]))')</string>
+            <string name="web_url" translatable="false">$(python3 -c 'import os,html; print(html.escape(os.environ["WEB_URL"]))')</string>
+          </resources>
+          EOF
+
+          if [[ -f app_icon.png ]]; then
+            cp app_icon.png app/src/main/res/drawable/app_icon.png
+            cat > app/src/main/res/drawable/icon_bg.xml <<'EOF'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle"><solid android:color="#FFFFFF"/></shape>
+          EOF
+          fi
+
+      - name: 06 • Setup Gradle 8.14.4
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.4'
+
+      - name: 07 • Build Web APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace --warning-mode=all assembleRelease
+
+      - name: 08 • Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: 09 • Diagnostics on failure
+        if: failure()
+        run: |
+          echo '--- build diagnostics ---'
+          java -version || true
+          gradle --version || true
+          find app -maxdepth 5 -type f | sort | head -200 || true
