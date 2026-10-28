@@ -45,7 +45,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, sys
+          import json, os, sys, re
           raw = os.environ.get("PAYLOAD", "")
           try:
               p = json.loads(raw)
@@ -58,11 +58,12 @@ jobs:
           if not (url.startswith("http://") or url.startswith("https://")):
               print("Payload URL must start with http:// or https://")
               sys.exit(1)
+          name = re.sub(r'[\x00-\x1f]', '', name)[:60]
           def envsafe(v: str) -> str:
               return v.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               f.write(f"WEB_URL={envsafe(url)}\n")
-              f.write(f"APP_NAME={envsafe(name[:60])}\n")
+              f.write(f"APP_NAME={envsafe(name)}\n")
               f.write(f"ICON_URL={envsafe(icon)}\n")
           print(f"URL={url}")
           print(f"APP_NAME={name}")
@@ -74,18 +75,17 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: 04 • Install Android SDK (cmdline-tools)
+      - name: 04 • Install Android SDK
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$ANDROID_HOME/cmdline-tools"
           cd /tmp
           curl -fsSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          unzip -q cmdtools.zip
+          unzip -q -o cmdtools.zip
           rm -rf "$ANDROID_HOME/cmdline-tools/latest"
           mv cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses >/tmp/sdk-licenses.txt 2>&1 || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
             "platform-tools" \
             "platforms;android-34" \
@@ -94,43 +94,57 @@ jobs:
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
-          ls -la "$ANDROID_HOME"
+          test -d "$ANDROID_HOME/platforms/android-34"
+          test -d "$ANDROID_HOME/build-tools/34.0.0"
+          echo "SDK OK"
 
       - name: 05 • Download icon
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p app/src/main/res/mipmap-hdpi app/src/main/res/drawable
+          mkdir -p app/src/main/res/mipmap-hdpi app/src/main/res/mipmap-mdpi app/src/main/res/mipmap-xhdpi app/src/main/res/mipmap-xxhdpi
           if [[ -n "${ICON_URL:-}" ]]; then
             echo "Downloading icon: $ICON_URL"
             if curl --fail --location --retry 3 --connect-timeout 15 --max-time 90 \
-                -A 'DUTA-BOT-APPS/1.0' "$ICON_URL" -o app_icon.png; then
-              file app_icon.png || true
-              # Resize / convert to PNG if needed (ImageMagick available on ubuntu-latest)
+                -A 'DUTA-BOT-APPS/1.0' "$ICON_URL" -o /tmp/app_icon_raw 2>/tmp/curl-icon.err; then
               if command -v convert >/dev/null 2>&1; then
-                convert app_icon.png -resize 192x192 app/src/main/res/mipmap-hdpi/ic_launcher.png || cp app_icon.png app/src/main/res/mipmap-hdpi/ic_launcher.png
+                convert /tmp/app_icon_raw -resize 72x72   app/src/main/res/mipmap-mdpi/ic_launcher.png  || true
+                convert /tmp/app_icon_raw -resize 96x96   app/src/main/res/mipmap-hdpi/ic_launcher.png  || true
+                convert /tmp/app_icon_raw -resize 144x144 app/src/main/res/mipmap-xhdpi/ic_launcher.png || true
+                convert /tmp/app_icon_raw -resize 192x192 app/src/main/res/mipmap-xxhdpi/ic_launcher.png || true
               else
-                cp app_icon.png app/src/main/res/mipmap-hdpi/ic_launcher.png
+                cp /tmp/app_icon_raw app/src/main/res/mipmap-hdpi/ic_launcher.png || true
               fi
             else
-              echo "Icon download failed, will use default"
+              cat /tmp/curl-icon.err || true
+              echo "Icon download failed"
             fi
           fi
-          # Default icon if missing
           if [[ ! -f app/src/main/res/mipmap-hdpi/ic_launcher.png ]]; then
             python3 - <<'PY'
           from pathlib import Path
-          # Minimal valid 1x1 PNG (will work as placeholder)
           import struct, zlib
-          def png(w, h, rgb=(33,150,243)):
+          def png(w, h, rgb=(33, 150, 243)):
               def chunk(t, d):
                   return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
-              raw = b''.join(b'\x00' + bytes(rgb)*w for _ in range(h))
-              return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b'')
-          Path('app/src/main/res/mipmap-hdpi/ic_launcher.png').write_bytes(png(192, 192))
-          print('Default icon written')
+              raw = b''.join(b'\x00' + bytes(rgb) * w for _ in range(h))
+              return (b'\x89PNG\r\n\x1a\n'
+                      + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                      + chunk(b'IDAT', zlib.compress(raw, 9))
+                      + chunk(b'IEND', b''))
+          for folder, size in [
+              ('mipmap-mdpi', 72),
+              ('mipmap-hdpi', 96),
+              ('mipmap-xhdpi', 144),
+              ('mipmap-xxhdpi', 192),
+          ]:
+              p = Path(f'app/src/main/res/{folder}')
+              p.mkdir(parents=True, exist_ok=True)
+              (p / 'ic_launcher.png').write_bytes(png(size, size))
+          print('Default blue icon written')
           PY
           fi
+          ls -la app/src/main/res/mipmap-*/ || true
 
       - name: 06 • Generate Android project
         shell: bash
@@ -138,7 +152,8 @@ jobs:
           set -euo pipefail
           mkdir -p app/src/main/java/com/duta/web2apk
           mkdir -p app/src/main/res/values
-          mkdir -p app/src/main/res/mipmap-hdpi
+
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
 
           cat > settings.gradle <<'EOF'
           pluginManagement {
@@ -155,13 +170,13 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = 'DutaWebAPK'
-          include ':app'
+          rootProject.name = "DutaWebAPK"
+          include(":app")
           EOF
 
           cat > build.gradle <<'EOF'
           plugins {
-              id 'com.android.application' version '8.7.3' apply false
+              id "com.android.application" version "8.5.2" apply false
           }
           EOF
 
@@ -169,122 +184,113 @@ jobs:
           org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
           android.useAndroidX=true
           android.nonTransitiveRClass=true
-          android.defaults.buildfeatures.buildconfig=true
           EOF
-
-          # local.properties for SDK path
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
 
           cat > app/build.gradle <<'EOF'
           plugins {
-              id 'com.android.application'
+              id "com.android.application"
           }
 
           android {
-              namespace 'com.duta.web2apk'
+              namespace "com.duta.web2apk"
               compileSdk 34
 
               defaultConfig {
-                  applicationId 'com.duta.web2apk'
+                  applicationId "com.duta.web2apk"
                   minSdk 23
                   targetSdk 34
                   versionCode 1
-                  versionName '1.0'
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
               }
 
               buildTypes {
+                  debug {
+                      minifyEnabled false
+                  }
                   release {
                       minifyEnabled false
                       shrinkResources false
-                      // Use debug keystore so APK is installable without custom key
-                      signingConfig signingConfigs.debug
-                  }
-              }
-
-              packaging {
-                  resources {
-                      excludes += ['META-INF/DEPENDENCIES', 'META-INF/LICENSE*', 'META-INF/NOTICE*']
                   }
               }
           }
 
           dependencies {
-              implementation 'androidx.appcompat:appcompat:1.7.0'
-              implementation 'androidx.webkit:webkit:1.12.1'
+              // minimal — pure Activity + system WebView, no heavy deps
           }
           EOF
 
-          # Manifest — label & icon
           python3 - <<'PY'
           import os, html
           name = html.escape(os.environ.get("APP_NAME", "Web App"), quote=True)
-          manifest = f'''<?xml version="1.0" encoding="utf-8"?>
+          open("app/src/main/AndroidManifest.xml", "w", encoding="utf-8").write(f'''<?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-            <uses-permission android:name="android.permission.INTERNET" />
-            <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-            <application
-                android:label="{name}"
-                android:icon="@mipmap/ic_launcher"
-                android:theme="@style/AppTheme"
-                android:usesCleartextTraffic="true"
-                android:allowBackup="false"
-                android:supportsRtl="true"
-                android:hardwareAccelerated="true">
-              <activity
-                  android:name=".MainActivity"
-                  android:exported="true"
-                  android:configChanges="orientation|screenSize|keyboardHidden"
-                  android:windowSoftInputMode="adjustResize">
-                <intent-filter>
-                  <action android:name="android.intent.action.MAIN" />
-                  <category android:name="android.intent.category.LAUNCHER" />
-                </intent-filter>
-              </activity>
-            </application>
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <application
+                  android:label="{name}"
+                  android:icon="@mipmap/ic_launcher"
+                  android:theme="@style/AppTheme"
+                  android:usesCleartextTraffic="true"
+                  android:allowBackup="false"
+                  android:supportsRtl="true"
+                  android:hardwareAccelerated="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|keyboard|screenLayout"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
           </manifest>
-          '''
-          open('app/src/main/AndroidManifest.xml', 'w', encoding='utf-8').write(manifest)
-          print('Manifest written')
+          ''')
+          print("Manifest OK")
           PY
 
           cat > app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
           <resources>
-            <style name="AppTheme" parent="Theme.AppCompat.Light.NoActionBar">
-              <item name="android:statusBarColor">#2196F3</item>
-              <item name="android:navigationBarColor">#000000</item>
-              <item name="colorPrimary">#2196F3</item>
-              <item name="colorPrimaryDark">#1976D2</item>
-              <item name="colorAccent">#2196F3</item>
-            </style>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:statusBarColor">#2196F3</item>
+                  <item name="android:navigationBarColor">#000000</item>
+                  <item name="android:windowBackground">#FFFFFF</item>
+              </style>
           </resources>
           EOF
 
-          # strings.xml
           python3 - <<'PY'
           import os, html
           name = html.escape(os.environ.get("APP_NAME", "Web App"))
           url  = html.escape(os.environ.get("WEB_URL", "https://example.com"))
-          open('app/src/main/res/values/strings.xml', 'w', encoding='utf-8').write(f'''<?xml version="1.0" encoding="utf-8"?>
+          open("app/src/main/res/values/strings.xml", "w", encoding="utf-8").write(f'''<?xml version="1.0" encoding="utf-8"?>
           <resources>
-            <string name="app_name">{name}</string>
-            <string name="web_url" translatable="false">{url}</string>
+              <string name="app_name">{name}</string>
+              <string name="web_url" translatable="false">{url}</string>
           </resources>
           ''')
-          print('strings.xml written')
+          print("strings OK:", name, url)
           PY
 
           cat > app/src/main/java/com/duta/web2apk/MainActivity.java <<'EOF'
           package com.duta.web2apk;
 
           import android.annotation.SuppressLint;
+          import android.app.Activity;
           import android.os.Bundle;
           import android.webkit.WebChromeClient;
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
-          import androidx.appcompat.app.AppCompatActivity;
 
-          public class MainActivity extends AppCompatActivity {
+          public class MainActivity extends Activity {
               private WebView webView;
 
               @SuppressLint("SetJavaScriptEnabled")
@@ -305,7 +311,9 @@ jobs:
                   s.setUseWideViewPort(true);
                   s.setAllowFileAccess(true);
                   s.setAllowContentAccess(true);
-                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                  try {
+                      s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                  } catch (Throwable ignored) {}
                   s.setCacheMode(WebSettings.LOAD_DEFAULT);
 
                   webView.setWebViewClient(new WebViewClient());
@@ -325,6 +333,10 @@ jobs:
               @Override
               protected void onDestroy() {
                   if (webView != null) {
+                      webView.loadUrl("about:blank");
+                      webView.stopLoading();
+                      webView.setWebViewClient(null);
+                      webView.setWebChromeClient(null);
                       webView.destroy();
                       webView = null;
                   }
@@ -333,41 +345,61 @@ jobs:
           }
           EOF
 
-          echo "Project generated OK"
-          find . -maxdepth 4 -type f | head -40
+          echo "=== Project tree ==="
+          find . -type f \( -name "*.gradle" -o -name "*.xml" -o -name "*.java" -o -name "*.properties" -o -name "*.png" \) | sort
 
       - name: 07 • Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.11.1"
+          gradle-version: "8.7"
 
-      - name: 08 • Build APK (release + debug signing)
+      - name: 08 • Build APK
         shell: bash
         run: |
           set -euo pipefail
-          gradle --no-daemon --stacktrace assembleRelease
-          echo "=== APK output ==="
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          # assembleDebug = always signed + installable, fewer failure modes
+          set +e
+          gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee /tmp/gradle-build.log
+          GRADLE_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "=== Looking for APK ==="
           find app/build/outputs -name "*.apk" -type f -ls || true
+          APK=$(find app/build/outputs -name "*.apk" -type f | head -1 || true)
+          if [[ -z "$APK" ]]; then
+            echo "NO APK PRODUCED — last 200 lines of gradle log:"
+            tail -200 /tmp/gradle-build.log || true
+            exit 1
+          fi
+          echo "APK_FOUND=$APK"
+          mkdir -p output
+          cp "$APK" output/app.apk
+          ls -la output/
+          exit $GRADLE_EXIT
 
       - name: 09 • Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ inputs.jobId }}
-          path: app/build/outputs/apk/release/*.apk
+          path: output/app.apk
           if-no-files-found: error
           retention-days: 2
 
       - name: 10 • Diagnostics on failure
         if: failure()
         run: |
-          echo '--- build diagnostics ---'
+          echo "===== DIAGNOSTICS ====="
           java -version || true
           echo "ANDROID_HOME=$ANDROID_HOME"
           ls -la "$ANDROID_HOME" 2>/dev/null || true
           ls -la "$ANDROID_HOME/platforms" 2>/dev/null || true
           ls -la "$ANDROID_HOME/build-tools" 2>/dev/null || true
-          gradle --version || true
-          find . -maxdepth 5 -type f | sort | head -100 || true
+          echo "--- local.properties ---"
           cat local.properties 2>/dev/null || true
+          echo "--- app/build.gradle ---"
           cat app/build.gradle 2>/dev/null || true
+          echo "--- last gradle log ---"
+          tail -200 /tmp/gradle-build.log 2>/dev/null || true
+          echo "--- project files ---"
+          find . -maxdepth 5 -type f | sort | head -80 || true
